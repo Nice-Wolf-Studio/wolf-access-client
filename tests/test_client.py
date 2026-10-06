@@ -305,9 +305,88 @@ def test_blank_explicit_zedtoken_with_nothing_remembered_is_omitted(server):
     assert "zedtoken" not in server.requests[0].body["context"]
 
 
-def test_decision_is_hashable_and_its_context_read_only(server):
+def test_decision_is_hashable_copyable_and_serializable(server):
+    import copy
+    import dataclasses
+    import json
+    import pickle
     server.reply = Reply(body={"decision": True, "context": {"reason_user": "owner"}})
     d = evaluate(WolfAccessClient(server.url, CRED))
     assert hash(d) == hash(Decision(allowed=True, context={"reason_user": "owner"}))
+    assert pickle.loads(pickle.dumps(d)) == d
+    assert copy.deepcopy(d) == d
+    assert json.loads(json.dumps(dataclasses.asdict(d))) == {
+        "allowed": True, "context": {"reason_user": "owner"}}
+
+
+@pytest.mark.parametrize("allowed", ["false", None, 1])
+def test_decision_allowed_must_be_a_bool(allowed):
     with pytest.raises(TypeError):
-        d.context["reason_user"] = "x"
+        Decision(allowed=allowed)
+
+
+# --- review round 2 -----------------------------------------------------------------
+
+def test_slow_headers_cannot_outlast_the_timeout():
+    import time
+    lines = [b"HTTP/1.1 200 OK\r\n"] + [b"X-Drip: 1\r\n"] * 30
+    with RawServer(*lines, gap=0.1) as srv:
+        start = time.monotonic()
+        with pytest.raises(WolfAccessUnavailable):
+            evaluate(WolfAccessClient(srv.url, CRED, timeout=0.5))
+        assert time.monotonic() - start < 1.0
+
+
+def test_https_always_verifies_certificates(monkeypatch):
+    import ssl
+    monkeypatch.setattr(ssl, "_create_default_https_context", ssl._create_unverified_context)
+    client = WolfAccessClient("https://wolf-access.example", CRED)
+    contexts = [h._context for h in client._opener.handlers
+                if isinstance(h, __import__("urllib.request").request.HTTPSHandler)]
+    assert len(contexts) == 1
+    assert contexts[0].verify_mode == ssl.CERT_REQUIRED and contexts[0].check_hostname
+
+
+@pytest.mark.parametrize("ctx", [{"client_id": "c", "when": {1, 2}},
+                                 {"client_id": "c", "x": float("nan")},
+                                 {"client_id": "c", "x": object()}])
+def test_context_must_be_json_serializable_and_nothing_is_sent(server, ctx):
+    with pytest.raises(ValueError):
+        evaluate(WolfAccessClient(server.url, CRED), context=ctx)
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("url", ["https://wolf-access.example\n", " https://wolf-access.example",
+                                 "https://wolf-access.example\t/x"])
+def test_base_url_with_whitespace_is_refused(url):
+    with pytest.raises(ValueError):
+        WolfAccessClient(url, CRED)
+
+
+@pytest.mark.parametrize("token", [b"GhUK", 5, ["t"]])
+def test_non_string_explicit_zedtoken_is_refused(server, token):
+    with pytest.raises(ValueError):
+        evaluate(WolfAccessClient(server.url, CRED),
+                 context={"client_id": "c", "zedtoken": token})
+    assert server.requests == []
+
+
+def test_oversized_body_is_a_response_error(server):
+    server.reply = Reply(raw=b'{"decision": true, "pad": "' + b"a" * (2 * 1024 * 1024) + b'"}')
+    with pytest.raises(WolfAccessResponseError):
+        evaluate(WolfAccessClient(server.url, CRED))
+
+
+@pytest.mark.parametrize("status", [201, 202, 203, 206])
+def test_only_200_is_a_decision(server, status):
+    server.reply = Reply(status=status, body={"decision": True})
+    with pytest.raises(WolfAccessHTTPError) as exc:
+        evaluate(WolfAccessClient(server.url, CRED))
+    assert exc.value.status == status
+
+
+def test_unavailable_keeps_its_cause():
+    client = WolfAccessClient(f"http://127.0.0.1:{_closed_port()}", CRED, timeout=1)
+    with pytest.raises(WolfAccessUnavailable) as exc:
+        evaluate(client)
+    assert exc.value.__cause__ is not None

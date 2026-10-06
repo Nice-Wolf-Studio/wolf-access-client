@@ -18,16 +18,6 @@ else:  # Python 3.10
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def pyproject_version() -> str:
-    text = (ROOT / "pyproject.toml").read_text()
-    if tomllib is not None:
-        return tomllib.loads(text)["project"]["version"]
-    for line in text.splitlines():
-        if line.startswith("version = "):
-            return line.split("=", 1)[1].strip().strip('"')
-    raise AssertionError("no version in pyproject.toml")
-
-
 @pytest.mark.skipif(tomllib is None, reason="tomllib needs Python 3.11+")
 def test_a129_pyproject_has_pep621_metadata():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
@@ -37,19 +27,26 @@ def test_a129_pyproject_has_pep621_metadata():
     assert project["readme"] == "README.md"
 
 
-def test_a129_package_version_matches_pyproject():
-    assert wolf_access_client.__version__ == pyproject_version()
+def test_a129_installed_version_is_the_package_version():
+    from importlib.metadata import version
+    assert version("wolf-access-client") == wolf_access_client.__version__
+
+
+def test_a129_pyproject_version_is_the_package_version():
+    """Criterion 129 reads the release version from pyproject.toml."""
+    text = (ROOT / "pyproject.toml").read_text()
+    assert f'version = "{wolf_access_client.__version__}"' in text.splitlines()
 
 
 def test_a129_release_tag_matches_version():
     """On a tag build (GitHub sets GITHUB_REF_TYPE=tag), the tag is vX.Y.Z."""
     if os.environ.get("GITHUB_REF_TYPE") != "tag":
         pytest.skip("not a tag build")
-    assert os.environ["GITHUB_REF_NAME"] == "v" + pyproject_version()
+    assert os.environ["GITHUB_REF_NAME"] == "v" + wolf_access_client.__version__
 
 
 ALLOWED_SUFFIXES = {".py", ".md", ".toml", ".yml"}
-ALLOWED_NAMES = {".gitignore"}
+ALLOWED_NAMES = {".gitignore", "LICENSE", "py.typed"}
 
 
 def tracked_files() -> list[str]:
