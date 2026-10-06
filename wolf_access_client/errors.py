@@ -8,11 +8,14 @@ class WolfAccessError(Exception):
 
 
 class WolfAccessUnavailable(WolfAccessError):
-    """wolf-access could not be reached, or did not answer in time."""
+    """wolf-access could not be reached, the TLS handshake failed, the HTTP
+    exchange broke, or no answer came within the timeout. The cause is
+    chained."""
 
 
 class WolfAccessHTTPError(WolfAccessError):
-    """wolf-access answered with a non-2xx status (redirects are not followed)."""
+    """wolf-access answered with a status other than 200 (redirects are not
+    followed)."""
 
     def __init__(self, status: int) -> None:
         super().__init__(f"wolf-access answered HTTP {status}")
@@ -20,4 +23,4 @@ class WolfAccessHTTPError(WolfAccessError):
 
 
 class WolfAccessResponseError(WolfAccessError):
-    """wolf-access answered 2xx but not with an AuthZEN evaluation response."""
+    """wolf-access answered 200 but not with an AuthZEN evaluation response."""

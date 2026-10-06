@@ -71,7 +71,9 @@ def can_view(caller, note_id) -> bool:
 - **Transport.** `https://` for any host; plain `http://` is refused except for private hosts
   (loopback, `localhost`, `*.railway.internal`). Certificates are always verified, environment
   proxies are ignored and redirects are not followed, so the credential only goes to
-  `base_url`'s host. `timeout` (default 5 s) bounds the whole call, name lookup to last byte.
+  `base_url`'s host. `timeout` (default 5 s, at most 3600 s) bounds the call on the caller's
+  thread: each socket operation waits at most `timeout`, and the connection is shut down when
+  the overall deadline passes (name lookup uses the system resolver's own limits).
 - The credential must be an RFC 6750 bearer token (no spaces, line breaks or control
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.
