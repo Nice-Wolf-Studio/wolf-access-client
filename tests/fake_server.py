@@ -26,6 +26,11 @@ class Seen:
     body: Any
 
 
+class _Server(ThreadingHTTPServer):
+    request_queue_size = 256  # concurrency tests open many connections at once
+    daemon_threads = True
+
+
 class FakeWolfAccess:
     def __init__(self) -> None:
         self.reply = Reply()
@@ -58,8 +63,7 @@ class FakeWolfAccess:
                 self.end_headers()
                 self.wfile.write(data)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
+        self._server = _Server(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         kwargs={"poll_interval": 0.02}, daemon=True)
 
