@@ -64,9 +64,15 @@ def can_view(caller, note_id) -> bool:
   it was given (`client.remember_zedtoken(token)` after a wolf-access write) as
   `context.zedtoken`, so a check after a write is at least as fresh as that write. A
   `zedtoken` passed in `context` wins.
-- The credential is never logged, put in `repr`, or included in an error.
-- Use `https://` over the public internet. Plain `http://` is accepted only for private
-  networking (for example inside the same Railway project).
+- **Transport.** `https://` for any host; plain `http://` is refused except for private hosts
+  (loopback, `localhost`, `*.railway.internal`). Environment proxies are ignored and redirects
+  are not followed, so the credential only goes to `base_url`'s host. `timeout` (default 5 s)
+  bounds the whole call.
+- The credential must be an RFC 6750 bearer token (no spaces, line breaks or control
+  characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
+  or included in an error.
+- One client holds one remembered ZedToken, the last one recorded. When several threads write
+  concurrently, pass each request's own token in `context["zedtoken"]`.
 
 ## Develop
 

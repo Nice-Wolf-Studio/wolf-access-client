@@ -199,3 +199,115 @@ def test_base_url_must_be_http_or_https(url):
 def test_credential_is_required():
     with pytest.raises(ValueError):
         WolfAccessClient("https://wolf-access.example", "")
+
+
+# --- review round 1 -----------------------------------------------------------------
+
+from tests.fake_server import RawServer  # noqa: E402
+
+
+@pytest.mark.parametrize("cred", [CRED + "\n", CRED + "\r\nX-Evil: 1", "a b", " " + CRED,
+                                  "tok\x00en"])
+def test_credential_must_be_a_bearer_token(cred):
+    with pytest.raises(ValueError) as exc:
+        WolfAccessClient("https://wolf-access.example", cred)
+    assert CRED not in str(exc.value)
+
+
+@pytest.mark.parametrize("raw", [
+    (b"garbage\r\n\r\n",),                                                  # bad status line
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"decision\": ",),    # cut short
+    (b"HTTP/1.1 200 OK\r\nX-Long: " + b"a" * 70000 + b"\r\n\r\n",),         # header too long
+])
+def test_broken_http_is_unavailable_not_an_escape(raw):
+    with RawServer(*raw) as srv:
+        with pytest.raises(WolfAccessUnavailable):
+            evaluate(WolfAccessClient(srv.url, CRED, timeout=2))
+
+
+def test_slow_drip_body_cannot_outlast_the_timeout():
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n"
+    drip = [b"{"] + [b" "] * 30
+    with RawServer(head, *drip, gap=0.1) as srv:
+        with pytest.raises(WolfAccessUnavailable):
+            evaluate(WolfAccessClient(srv.url, CRED, timeout=0.5))
+
+
+def test_deeply_nested_json_is_a_response_error(server):
+    server.reply = Reply(raw=b"[" * 200000)
+    with pytest.raises(WolfAccessResponseError):
+        evaluate(WolfAccessClient(server.url, CRED))
+
+
+def test_environment_proxy_is_never_used(server, monkeypatch):
+    with FakeWolfAccess() as proxy:
+        for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
+            monkeypatch.setenv(name, proxy.url)
+        for name in ("no_proxy", "NO_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+        evaluate(WolfAccessClient(server.url, CRED))
+        assert proxy.requests == []
+        assert len(server.requests) == 1
+
+
+def test_null_context_in_the_response_is_an_empty_context(server):
+    server.reply = Reply(body={"decision": True, "context": None})
+    assert evaluate(WolfAccessClient(server.url, CRED)) == Decision(allowed=True, context={})
+
+
+@pytest.mark.parametrize("url", ["http://wolf-access.example.com",
+                                 "http://203.0.113.7:8080"])
+def test_plain_http_is_refused_for_public_hosts(url):
+    with pytest.raises(ValueError):
+        WolfAccessClient(url, CRED)
+
+
+@pytest.mark.parametrize("url", ["https://wolf-access.example.com",
+                                 "http://wolf-access.railway.internal:8000",
+                                 "http://localhost:8000", "http://127.0.0.1:9",
+                                 "http://[::1]:9"])
+def test_https_anywhere_and_http_only_on_private_hosts(url):
+    WolfAccessClient(url, CRED)
+
+
+@pytest.mark.parametrize("url", ["https://host/?env=prod", "https://host/#x",
+                                 "https://u:pw@host", "https://host:notaport"])
+def test_base_url_without_query_fragment_userinfo_or_bad_port(url):
+    with pytest.raises(ValueError) as exc:
+        WolfAccessClient(url, CRED)
+    assert "pw" not in str(exc.value)
+
+
+@pytest.mark.parametrize("timeout", [None, 0, -1, float("inf"), float("nan"), "5", True])
+def test_timeout_must_be_a_positive_finite_number(timeout):
+    with pytest.raises(ValueError):
+        WolfAccessClient("https://wolf-access.example", CRED, timeout=timeout)
+
+
+@pytest.mark.parametrize("field_name", ["action", "resource_type", "resource_id"])
+@pytest.mark.parametrize("value", [None, "", "  ", 5])
+def test_action_and_resource_are_required(server, field_name, value):
+    with pytest.raises(ValueError):
+        evaluate(WolfAccessClient(server.url, CRED), **{field_name: value})
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("blank", [None, ""])
+def test_blank_explicit_zedtoken_does_not_hide_the_remembered_one(server, blank):
+    client = WolfAccessClient(server.url, CRED)
+    client.remember_zedtoken("zt-remembered")
+    evaluate(client, context={"client_id": "c", "zedtoken": blank})
+    assert server.requests[0].body["context"]["zedtoken"] == "zt-remembered"
+
+
+def test_blank_explicit_zedtoken_with_nothing_remembered_is_omitted(server):
+    evaluate(WolfAccessClient(server.url, CRED), context={"client_id": "c", "zedtoken": None})
+    assert "zedtoken" not in server.requests[0].body["context"]
+
+
+def test_decision_is_hashable_and_its_context_read_only(server):
+    server.reply = Reply(body={"decision": True, "context": {"reason_user": "owner"}})
+    d = evaluate(WolfAccessClient(server.url, CRED))
+    assert hash(d) == hash(Decision(allowed=True, context={"reason_user": "owner"}))
+    with pytest.raises(TypeError):
+        d.context["reason_user"] = "x"

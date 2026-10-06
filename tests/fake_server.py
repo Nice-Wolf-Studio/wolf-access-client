@@ -74,3 +74,51 @@ class FakeWolfAccess:
     def __exit__(self, *exc: Any) -> None:
         self._server.shutdown()
         self._server.server_close()
+
+
+class RawServer:
+    """A loopback TCP server that answers every connection with `chunks`
+    (raw bytes, sent `gap` seconds apart), then closes: for broken HTTP."""
+
+    def __init__(self, *chunks: bytes, gap: float = 0.0) -> None:
+        import socket as _socket
+        self._chunks = chunks
+        self._gap = gap
+        self._sock = _socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+
+    def _run(self) -> None:
+        self._sock.settimeout(0.05)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                continue
+            with conn:
+                conn.settimeout(2)
+                try:
+                    conn.recv(65536)
+                    for chunk in self._chunks:
+                        if self._stop.is_set():
+                            break
+                        conn.sendall(chunk)
+                        if self._gap:
+                            time.sleep(self._gap)
+                except OSError:
+                    pass
+
+    def __enter__(self) -> "RawServer":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        self._thread.join(5)
+        self._sock.close()

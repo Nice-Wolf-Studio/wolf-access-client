@@ -4,6 +4,8 @@
 name: ci
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 permissions:
   contents: read
@@ -15,6 +17,8 @@ jobs:
         python: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -27,14 +31,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: TruffleHog over the full git history
         run: >-
-          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:3.97.9
+          docker run --rm -v "$PWD:/repo"
+          trufflesecurity/trufflehog:3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
           git file:///repo --no-update --fail --results=verified,unknown
 
   install-from-tag:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -44,5 +53,5 @@ jobs:
           python -m venv "$RUNNER_TEMP/v"
           env -i PATH="/usr/bin:/bin" HOME="$(mktemp -d)" GIT_CONFIG_NOSYSTEM=1 \
             "$RUNNER_TEMP/v/bin/pip" install --no-cache-dir \
-            "git+https://github.com/${{ github.repository }}@${{ github.ref_name }}"
-          "$RUNNER_TEMP/v/bin/python" -c "import wolf_access_client as w; assert 'v' + w.__version__ == '${{ github.ref_name }}', w.__version__; print('installed', w.__version__)"
+            "git+https://github.com/$REPO@$TAG"
+          "$RUNNER_TEMP/v/bin/python" -c 'import os, wolf_access_client as w; assert "v" + w.__version__ == os.environ["TAG"], w.__version__; print("installed", w.__version__)'
