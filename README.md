@@ -50,12 +50,13 @@ def can_view(caller, note_id) -> bool:
 {"subject":  {"type": "user", "id": "<gateway user_id>"},
  "action":   {"name": "view"},
  "resource": {"type": "wolfnotes/note", "id": "<note id>"},
- "context":  {"client_id": "<gateway client_id>", "zedtoken": "<newest ZedToken, if any>"}}
+ "context":  {"client_id": "<gateway client_id>", "zedtoken": "<last recorded ZedToken, if any>"}}
 ```
 
 - `subject_user_id` (the gateway `user_id`), `action`, `resource_type`, `resource_id` and
   `context["client_id"]` (the gateway `client_id`) are required non-empty strings, and
-  `context` must be JSON-serializable; otherwise nothing is sent and `ValueError` is raised.
+  `context` must be a mapping with string keys that is JSON-serializable; otherwise nothing is
+  sent and `ValueError` is raised.
 - It returns `Decision(allowed, context)`. A deny is `Decision(allowed=False)`, a value, not
   an error.
 - **Fail closed.** Every failure to get a decision raises a `WolfAccessError` subclass, so the
@@ -71,9 +72,9 @@ def can_view(caller, note_id) -> bool:
 - **Transport.** `https://` for any host; plain `http://` is refused except for private hosts
   (loopback, `localhost`, `*.railway.internal`). Certificates are always verified, environment
   proxies are ignored and redirects are not followed, so the credential only goes to
-  `base_url`'s host. `timeout` (default 5 s, at most 3600 s) bounds the call on the caller's
-  thread: each socket operation waits at most `timeout`, and the connection is shut down when
-  the overall deadline passes (name lookup uses the system resolver's own limits).
+  `base_url`'s host. `timeout` (default 5 s, at most 3600 s) limits each network operation
+  (each connect attempt, the send, each read) and the body read as a whole. The call runs on
+  the caller's thread and starts no threads. Name lookup uses the system resolver's own limits.
 - The credential must be an RFC 6750 bearer token (no spaces, line breaks or control
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.

@@ -21,6 +21,9 @@ class WolfAccessHTTPError(WolfAccessError):
         super().__init__(f"wolf-access answered HTTP {status}")
         self.status = status
 
+    def __reduce__(self):  # noqa: ANN204  (pickle/copy rebuild from the status)
+        return (type(self), (self.status,))
+
 
 class WolfAccessResponseError(WolfAccessError):
     """wolf-access answered 200 but not with an AuthZEN evaluation response."""

@@ -61,3 +61,9 @@ def test_a216_repository_holds_code_only_no_data():
                  if Path(f).suffix not in ALLOWED_SUFFIXES
                  and Path(f).name not in ALLOWED_NAMES]
     assert offenders == []
+
+
+def test_package_ships_a_py_typed_marker():
+    assert (ROOT / "wolf_access_client" / "py.typed").exists()
+    assert 'package-data = {wolf_access_client = ["py.typed"]}' in (
+        ROOT / "pyproject.toml").read_text()

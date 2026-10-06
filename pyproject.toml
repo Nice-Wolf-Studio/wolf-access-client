@@ -18,6 +18,7 @@ Source = "https://github.com/Nice-Wolf-Studio/wolf-access-client"
 
 [tool.setuptools]
 packages = ["wolf_access_client"]
+package-data = {wolf_access_client = ["py.typed"]}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

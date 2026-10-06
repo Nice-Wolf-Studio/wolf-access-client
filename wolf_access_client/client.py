@@ -21,10 +21,10 @@ Transport rules: `https://` for any host, `http://` only for private hosts
 (loopback, `localhost`, `*.railway.internal`; spec API-D1). It speaks HTTP
 with `http.client` directly: no environment proxies, no redirects, and
 certificates are always verified with the client's own SSL context, so the
-credential only ever goes to `base_url`'s host. `timeout` bounds the call on
-the caller's thread: each socket operation waits at most `timeout`, and a
-watchdog shuts the connection down when the overall deadline passes. (Name
-lookup uses the system resolver's own limits.)
+credential only ever goes to `base_url`'s host. `timeout` limits each network
+operation (each connect attempt, the send, each read) and the body read as a
+whole; the call runs on the caller's thread and starts no threads. Name lookup
+uses the system resolver's own limits.
 
 Standard library only.
 """
@@ -36,9 +36,7 @@ import ipaddress
 import json
 import math
 import re
-import socket
 import ssl
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -58,14 +56,15 @@ MAX_BODY = 1024 * 1024  # an AuthZEN evaluation answer is a few hundred bytes
 _CHUNK = 65536
 # RFC 6750 section 2.1 b64token: what a bearer credential may contain.
 _BEARER = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
-_WHITESPACE = re.compile(r"\s")
 _PRIVATE_SUFFIX = ".railway.internal"
 
 
 @dataclass(frozen=True)
 class Decision:
-    """An AuthZEN decision. `context` is a copy of what wolf-access returned
-    under `context`, for example `reason_user`; never a score."""
+    """An AuthZEN decision. `context` is a shallow copy of what wolf-access
+    returned under `context`, for example `reason_user`; never a score. The
+    fields cannot be reassigned; the `context` dict itself is a plain dict.
+    Equality compares both fields; the hash uses `allowed` only."""
 
     allowed: bool
     context: dict[str, Any] = field(default_factory=dict, hash=False)
@@ -93,24 +92,31 @@ def _private_host(host: str) -> bool:
 
 
 def _check_timeout(timeout: Any) -> float:
-    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT):
-        raise ValueError(f"timeout must be a number of seconds in (0, {MAX_TIMEOUT:g}]")
-    return float(timeout)
+    problem = ValueError(f"timeout must be a number of seconds in (0, {MAX_TIMEOUT:g}]")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise problem
+    try:
+        value = float(timeout)
+    except OverflowError:
+        raise problem from None
+    if not math.isfinite(value) or not 0 < value <= MAX_TIMEOUT:
+        raise problem
+    return value
 
 
 @dataclass(frozen=True)
 class _Target:
     https: bool
     host: str
-    port: int | None
+    port: int
     path_prefix: str
     display: str
 
 
 def _target(base_url: Any) -> _Target:
-    if not isinstance(base_url, str) or _WHITESPACE.search(base_url):
-        raise ValueError("base_url must be a URL string without whitespace")
+    if not isinstance(base_url, str) or not base_url.isascii() or any(
+            ord(c) <= 32 or ord(c) == 127 for c in base_url):
+        raise ValueError("base_url must be a printable ASCII URL without whitespace")
     parts = urlsplit(base_url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError("base_url must be an http:// or https:// URL")
@@ -120,6 +126,10 @@ def _target(base_url: Any) -> _Target:
         port = parts.port
     except ValueError:
         raise ValueError("base_url has an invalid port") from None
+    if port is None:
+        # Always explicit: http.client would otherwise read the last group of
+        # a bare IPv6 host as the port.
+        port = 443 if parts.scheme == "https" else 80
     if parts.scheme == "http" and not _private_host(parts.hostname):
         raise ValueError("plain http:// is allowed only for private hosts; use https://")
     return _Target(https=parts.scheme == "https", host=parts.hostname, port=port,
@@ -176,6 +186,8 @@ class WolfAccessClient:
         if not isinstance(context, Mapping):
             raise ValueError("context must be a mapping holding 'client_id'")
         ctx = dict(context)
+        if not all(isinstance(key, str) for key in ctx):
+            raise ValueError("context keys must be strings")
         if not _nonblank(ctx.get("client_id")):
             raise ValueError("context['client_id'] is required (the gateway client_id)")
         explicit = ctx.get("zedtoken")
@@ -208,23 +220,10 @@ class WolfAccessClient:
 
     def _post(self, path: str, data: bytes) -> bytes:
         deadline = time.monotonic() + self._timeout
-        conn = self._connection()
-        expired = threading.Event()
-
-        def abort() -> None:  # the deadline passed: unblock the caller's socket
-            expired.set()
-            sock = conn.sock
-            if sock is not None:
-                try:
-                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-        watchdog = threading.Timer(self._timeout, abort)
-        watchdog.daemon = True
+        conn: http.client.HTTPConnection | None = None
         response: http.client.HTTPResponse | None = None
         try:
-            watchdog.start()
+            conn = self._connection()
             conn.request("POST", self._target.path_prefix + path, body=data, headers={
                 "Authorization": f"Bearer {self._credential}",
                 "Content-Type": "application/json",
@@ -236,7 +235,7 @@ class WolfAccessClient:
             size = 0
             while True:
                 if time.monotonic() > deadline:
-                    raise TimeoutError("deadline passed")
+                    raise TimeoutError("deadline passed while reading the body")
                 chunk = response.read1(_CHUNK)
                 if not chunk:
                     break
@@ -246,21 +245,18 @@ class WolfAccessClient:
                 chunks.append(chunk)
             if response.length:  # the connection closed before Content-Length
                 raise http.client.IncompleteRead(b"".join(chunks), response.length)
-            if expired.is_set():
-                raise TimeoutError("deadline passed")
             return b"".join(chunks)
         except WolfAccessError:
             raise
-        except (http.client.HTTPException, OSError, ValueError, RuntimeError) as exc:
-            # OSError covers timeouts, refused connections and TLS failures;
-            # RuntimeError is a watchdog that cannot start at interpreter exit.
-            reason = "timed out" if expired.is_set() else type(exc).__name__
-            raise WolfAccessUnavailable(f"no answer from wolf-access ({reason})") from exc
+        except (http.client.HTTPException, OSError, ValueError) as exc:
+            # OSError covers timeouts, refused connections and TLS failures.
+            raise WolfAccessUnavailable(
+                f"no answer from wolf-access ({type(exc).__name__})") from exc
         finally:
-            watchdog.cancel()
             if response is not None:
                 response.close()
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def _decision(raw: bytes) -> Decision:

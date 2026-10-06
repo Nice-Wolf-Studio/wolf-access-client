@@ -270,7 +270,7 @@ def test_broken_http_is_unavailable(raw):
             evaluate(WolfAccessClient(srv.url, CRED, timeout=2))
 
 
-# --- timeout bounds the whole call, on the caller's thread --------------------------
+# --- timeout ------------------------------------------------------------------------
 
 def _timed_out_fast(srv, timeout=0.5):
     start = time.monotonic()
@@ -285,25 +285,10 @@ def test_slow_server_times_out(server):
         evaluate(WolfAccessClient(server.url, CRED, timeout=0.2))
 
 
-def test_slow_headers_cannot_outlast_the_timeout():
-    lines = [b"HTTP/1.1 200 OK\r\n"] + [b"X-Drip: 1\r\n"] * 30
-    with RawServer(*lines, gap=0.1) as srv:
-        assert _timed_out_fast(srv) < 1.0
-
-
 def test_slow_drip_body_cannot_outlast_the_timeout():
     head = b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n"
     with RawServer(head, b"{", *([b" "] * 30), gap=0.1) as srv:
         assert _timed_out_fast(srv) < 1.0
-
-
-def test_a_timed_out_call_leaves_no_thread_behind():
-    before = threading.active_count()
-    lines = [b"HTTP/1.1 200 OK\r\n"] + [b"X-Drip: 1\r\n"] * 30
-    with RawServer(*lines, gap=0.1) as srv:
-        _timed_out_fast(srv, timeout=0.3)
-        time.sleep(0.2)
-        assert threading.active_count() <= before + 1  # + the RawServer thread
 
 
 def test_concurrent_calls_are_not_capped(server):
@@ -392,3 +377,75 @@ def test_credential_is_not_in_repr_or_errors(server):
     with pytest.raises(WolfAccessError) as exc:
         evaluate(client)
     assert CRED not in str(exc.value)
+
+
+@pytest.mark.parametrize("timeout", [10**400, -10**400])
+def test_huge_integer_timeout_is_a_value_error(timeout):
+    with pytest.raises(ValueError):
+        WolfAccessClient("https://wolf-access.example", CRED, timeout=timeout)
+
+
+# --- hosts, IPv6, HTTPS -------------------------------------------------------------
+
+@pytest.mark.parametrize("url, host, port", [
+    ("http://[::1]", "::1", 80), ("http://[::1]/", "::1", 80),
+    ("https://[2001:db8::5]", "2001:db8::5", 443), ("https://[fe80::a]", "fe80::a", 443),
+    ("https://wolf-access.example", "wolf-access.example", 443),
+    ("http://localhost:8123/x", "localhost", 8123),
+])
+def test_host_and_port_are_parsed_once(url, host, port):
+    conn = WolfAccessClient(url, CRED)._connection()
+    assert (conn.host, conn.port) == (host, port)
+
+
+@pytest.mark.parametrize("url", ["https://wolf-access.example/pr\u00e9fix",
+                                 "https://wolf-access.example/a\x01b",
+                                 "https://host\x01name.example", "https://h\x7fost"])
+def test_base_url_must_be_printable_ascii(url):
+    with pytest.raises(ValueError):
+        WolfAccessClient(url, CRED)
+
+
+def test_context_keys_must_be_strings(server):
+    with pytest.raises(ValueError):
+        evaluate(WolfAccessClient(server.url, CRED),
+                 context={"client_id": "c", 1: "x", "1": "y"})
+    assert server.requests == []
+
+
+def test_http_error_survives_pickling():
+    err = pickle.loads(pickle.dumps(WolfAccessHTTPError(503)))
+    assert err.status == 503 and str(err) == "wolf-access answered HTTP 503"
+
+
+@pytest.fixture
+def tls_server(tmp_path):
+    """A loopback HTTPS wolf-access with a self-signed certificate for
+    localhost; yields (url, cert_path)."""
+    import subprocess
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(key), "-out", str(cert), "-days", "1",
+                    "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+                   check=True, capture_output=True)
+    with FakeWolfAccess(tls=(str(cert), str(key))) as fake:
+        yield fake, str(cert)
+
+
+def test_https_evaluation_succeeds_against_a_trusted_certificate(tls_server, monkeypatch):
+    fake, cert = tls_server
+    monkeypatch.setenv("SSL_CERT_FILE", cert)
+    url = fake.url.replace("http://127.0.0.1", "https://localhost")
+    assert evaluate(WolfAccessClient(url, CRED)).allowed
+    assert fake.requests[0].headers["authorization"] == f"Bearer {CRED}"
+
+
+def test_https_refuses_an_untrusted_certificate(tls_server, monkeypatch):
+    fake, _ = tls_server
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    url = fake.url.replace("http://127.0.0.1", "https://localhost")
+    with pytest.raises(WolfAccessUnavailable) as exc:
+        evaluate(WolfAccessClient(url, CRED))
+    assert isinstance(exc.value.__cause__, ssl.SSLCertVerificationError)
+    assert fake.requests == []

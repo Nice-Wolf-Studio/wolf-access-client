@@ -32,7 +32,7 @@ class _Server(ThreadingHTTPServer):
 
 
 class FakeWolfAccess:
-    def __init__(self) -> None:
+    def __init__(self, tls: tuple[str, str] | None = None) -> None:
         self.reply = Reply()
         self.requests: list[Seen] = []
         outer = self
@@ -64,6 +64,11 @@ class FakeWolfAccess:
                 self.wfile.write(data)
 
         self._server = _Server(("127.0.0.1", 0), Handler)
+        if tls is not None:
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(*tls)
+            self._server.socket = ctx.wrap_socket(self._server.socket, server_side=True)
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         kwargs={"poll_interval": 0.02}, daemon=True)
 
