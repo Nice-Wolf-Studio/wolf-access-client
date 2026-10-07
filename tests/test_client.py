@@ -1,6 +1,6 @@
 """WolfAccessClient.evaluation: AuthZEN 1.0 request shape (API-P1, API-D4,
-API-D5), ZedToken carried (CLI-D2), fail closed (CLI-P2), transport rules
-(API-D1)."""
+API-D5), `user_id` and `client_id` explicit on every decision, ZedToken
+carried (CLI-D2), fail closed (CLI-P2), transport rules (API-D1)."""
 import concurrent.futures
 import contextlib
 import copy
@@ -9,14 +9,15 @@ import json
 import pickle
 import socket
 import ssl
-import threading
 import time
 
 import pytest
 
 from tests.fake_server import FakeWolfAccess, RawServer, Reply
 from wolf_access_client import (
+    AccessUnavailable,
     Decision,
+    DecisionRefused,
     WolfAccessClient,
     WolfAccessError,
     WolfAccessHTTPError,
@@ -43,8 +44,8 @@ def refused_port():
 
 
 def evaluate(client, **overrides):
-    args = dict(subject_user_id="user-1", action="view", resource_type="wolfnotes/note",
-                resource_id="n-1", context={"client_id": "client-1"})
+    args = dict(user_id="user-1", client_id="client-1", action="view",
+                resource_type="wolfnotes/note", resource_id="n-1")
     args.update(overrides)
     return client.evaluation(**args)
 
@@ -73,31 +74,64 @@ def test_base_url_with_path_and_trailing_slash(server):
 
 
 def test_extra_context_is_passed_through(server):
-    evaluate(WolfAccessClient(server.url, CRED),
-             context={"client_id": "client-1", "review_case": "case-9"})
+    evaluate(WolfAccessClient(server.url, CRED), context={"review_case": "case-9"})
     assert server.requests[0].body["context"] == {"client_id": "client-1",
                                                   "review_case": "case-9"}
 
 
 def test_callers_context_is_not_mutated(server):
-    ctx = {"client_id": "client-1"}
+    ctx = {"review_case": "case-9"}
     client = WolfAccessClient(server.url, CRED)
     client.remember_zedtoken("zt-1")
     evaluate(client, context=ctx)
-    assert ctx == {"client_id": "client-1"}
+    assert ctx == {"review_case": "case-9"}
+
+
+def test_no_context_and_empty_context_send_only_the_client_id(server):
+    client = WolfAccessClient(server.url, CRED)
+    evaluate(client, context=None)
+    evaluate(client, context={})
+    assert [r.body["context"] for r in server.requests] == [{"client_id": "client-1"}] * 2
 
 
 # --- input validation: nothing is sent --------------------------------------------
 
-@pytest.mark.parametrize("ctx", [None, {}, {"client_id": ""}, {"client_id": None}, 5,
-                                 [("client_id", "c")]])
-def test_context_must_be_a_mapping_with_a_client_id(server, ctx):
+def test_user_id_and_client_id_are_keyword_only(server):
+    """Two positional strings could be swapped silently; the identity of the
+    call is named at every call site (CLI-P1, API-D8)."""
+    client = WolfAccessClient(server.url, CRED)
+    with pytest.raises(TypeError):
+        client.evaluation("user-1", "client-1", "view", "wolfnotes/note", "n-1")
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("missing", ["user_id", "client_id"])
+def test_user_id_and_client_id_are_never_supplied_by_the_library(server, missing):
+    args = dict(user_id="user-1", client_id="client-1", action="view",
+                resource_type="wolfnotes/note", resource_id="n-1")
+    del args[missing]
+    with pytest.raises(TypeError):
+        WolfAccessClient(server.url, CRED).evaluation(**args)
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("ctx", [5, [("review_case", "c")], "review_case"])
+def test_context_must_be_a_mapping(server, ctx):
     with pytest.raises(ValueError):
         evaluate(WolfAccessClient(server.url, CRED), context=ctx)
     assert server.requests == []
 
 
-@pytest.mark.parametrize("field_name", ["subject_user_id", "action", "resource_type",
+@pytest.mark.parametrize("key", ["client_id", "user_id", "zedtoken"])
+def test_context_cannot_carry_the_explicit_parameters(server, key):
+    """`client_id`, `user_id` and the ZedToken are parameters, never smuggled
+    in through `context`."""
+    with pytest.raises(ValueError):
+        evaluate(WolfAccessClient(server.url, CRED), context={key: "other"})
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("field_name", ["user_id", "client_id", "action", "resource_type",
                                         "resource_id"])
 @pytest.mark.parametrize("value", [None, "", "  ", 5])
 def test_subject_action_and_resource_are_required(server, field_name, value):
@@ -106,9 +140,7 @@ def test_subject_action_and_resource_are_required(server, field_name, value):
     assert server.requests == []
 
 
-@pytest.mark.parametrize("ctx", [{"client_id": "c", "when": {1, 2}},
-                                 {"client_id": "c", "x": float("nan")},
-                                 {"client_id": "c", "x": object()}])
+@pytest.mark.parametrize("ctx", [{"when": {1, 2}}, {"x": float("nan")}, {"x": object()}])
 def test_context_must_be_json_serializable(server, ctx):
     with pytest.raises(ValueError):
         evaluate(WolfAccessClient(server.url, CRED), context=ctx)
@@ -143,7 +175,8 @@ def test_decision_is_hashable_copyable_and_serializable(server):
     assert pickle.loads(pickle.dumps(d)) == d
     assert copy.deepcopy(d) == d
     assert json.loads(json.dumps(dataclasses.asdict(d))) == {
-        "allowed": True, "context": {"reason_user": "owner"}}
+        "allowed": True, "context": {"reason_user": "owner"}, "evaluated": True}
+    assert d.evaluated is True and d.error is None
 
 
 @pytest.mark.parametrize("allowed", ["false", None, 1])
@@ -174,40 +207,48 @@ def test_remembered_zedtoken_is_sent(server):
     assert client.zedtoken == "zt-1"
 
 
-def test_explicit_zedtoken_in_context_wins(server):
+def test_explicit_zedtoken_wins(server):
     client = WolfAccessClient(server.url, CRED)
     client.remember_zedtoken("zt-old")
-    evaluate(client, context={"client_id": "c", "zedtoken": "zt-explicit"})
+    evaluate(client, zedtoken="zt-explicit")
     assert server.requests[0].body["context"]["zedtoken"] == "zt-explicit"
+    assert client.zedtoken == "zt-old"
 
 
 @pytest.mark.parametrize("blank", [None, ""])
 def test_blank_explicit_zedtoken_does_not_hide_the_remembered_one(server, blank):
     client = WolfAccessClient(server.url, CRED)
     client.remember_zedtoken("zt-remembered")
-    evaluate(client, context={"client_id": "c", "zedtoken": blank})
+    evaluate(client, zedtoken=blank)
     assert server.requests[0].body["context"]["zedtoken"] == "zt-remembered"
 
 
 def test_blank_explicit_zedtoken_with_nothing_remembered_is_omitted(server):
-    evaluate(WolfAccessClient(server.url, CRED), context={"client_id": "c", "zedtoken": None})
+    evaluate(WolfAccessClient(server.url, CRED), zedtoken=None)
     assert "zedtoken" not in server.requests[0].body["context"]
 
 
 @pytest.mark.parametrize("token", [b"GhUK", 5, ["t"]])
 def test_non_string_explicit_zedtoken_is_refused(server, token):
     with pytest.raises(ValueError):
-        evaluate(WolfAccessClient(server.url, CRED),
-                 context={"client_id": "c", "zedtoken": token})
+        evaluate(WolfAccessClient(server.url, CRED), zedtoken=token)
     assert server.requests == []
 
 
 # --- fail closed (CLI-P2) -----------------------------------------------------------
 
 def test_every_failure_class_is_a_wolf_access_error():
-    for error in (WolfAccessUnavailable, WolfAccessHTTPError, WolfAccessResponseError):
+    for error in (WolfAccessUnavailable, WolfAccessHTTPError, WolfAccessResponseError,
+                  AccessUnavailable, DecisionRefused):
         assert issubclass(error, WolfAccessError)
     assert not issubclass(WolfAccessError, ValueError)
+
+
+def test_every_way_a_decision_can_fail_is_access_unavailable():
+    """CLI-P2: one type the caller treats as deny, distinct from a real deny
+    (which is a `Decision(allowed=False)` value)."""
+    for error in (WolfAccessUnavailable, WolfAccessResponseError, DecisionRefused):
+        assert issubclass(error, AccessUnavailable)
 
 
 def test_unreachable_is_unavailable_with_its_cause():
@@ -229,9 +270,28 @@ def test_tls_failure_is_unavailable(server):
                                     503])
 def test_any_status_but_200_is_an_http_error(server, status):
     server.reply = Reply(status=status, body={"decision": True})
-    with pytest.raises(WolfAccessHTTPError) as exc:
+    with pytest.raises(DecisionRefused) as exc:
         evaluate(WolfAccessClient(server.url, CRED))
     assert exc.value.status == status
+    assert isinstance(exc.value, AccessUnavailable)
+    assert isinstance(exc.value, WolfAccessHTTPError)
+
+
+@pytest.mark.parametrize("status, retry_after, retryable", [
+    (429, "30", True), (503, "5", True), (500, None, True), (403, None, False),
+    (401, None, False)])
+def test_decision_refusal_carries_status_and_retry_after(server, status, retry_after,
+                                                         retryable):
+    """The decision API answers errors in plain text (AuthZEN); the client
+    keeps the status and `Retry-After`, never the server's text."""
+    server.reply = Reply(status=status, raw=b"too many requests (API-S1)",
+                         content_type="text/plain",
+                         headers={"Retry-After": retry_after} if retry_after else {})
+    with pytest.raises(DecisionRefused) as exc:
+        evaluate(WolfAccessClient(server.url, CRED))
+    assert exc.value.retry_after == (float(retry_after) if retry_after else None)
+    assert exc.value.retryable is retryable
+    assert "API-S1" not in str(exc.value)
 
 
 def test_redirect_is_not_followed(server):
@@ -408,14 +468,15 @@ def test_base_url_must_be_printable_ascii(url):
 
 def test_context_keys_must_be_strings(server):
     with pytest.raises(ValueError):
-        evaluate(WolfAccessClient(server.url, CRED),
-                 context={"client_id": "c", 1: "x", "1": "y"})
+        evaluate(WolfAccessClient(server.url, CRED), context={1: "x", "1": "y"})
     assert server.requests == []
 
 
 def test_http_error_survives_pickling():
     err = pickle.loads(pickle.dumps(WolfAccessHTTPError(503)))
     assert err.status == 503 and str(err) == "wolf-access answered HTTP 503"
+    err = pickle.loads(pickle.dumps(DecisionRefused(429, retry_after=7.0)))
+    assert (type(err), err.status, err.retry_after) == (DecisionRefused, 429, 7.0)
 
 
 @pytest.fixture
