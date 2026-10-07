@@ -232,6 +232,25 @@ def test_withheld_in_shadow_withholds_nothing_and_logs_what_on_would(server, sto
     assert [r.user_id for r in events(caplog, "shadow_deny")] == [None, None]
 
 
+def test_shadow_never_returns_hints(server, store, sqlite_backend):
+    """CUT-D1 (2) as corrected (wolf-access f1ff093): `shadow` answers exactly
+    like `off`, which makes no decision call and so has no wolf-access hints.
+    The library returns no hint in any mode (#31): a search page carrying
+    `context.hints` yields resource references only."""
+    server.reply = Reply(body={
+        "results": [{"type": NOTE, "id": "n-1"}], "page": {"next_token": "", "count": 1},
+        "context": {"hints": [{"person": "user-2", "topic": "t-1", "hint": "h-1"}]}})
+    append(sqlite_backend, move("n-1"))                 # n-1 is stale: shadow keeps it
+    gate = gate_for("shadow", server, store)
+    client = WolfAccessClient(server.url, CRED, service="wolfnotes")
+    found = list(client.search_resources(user_id="user-1", client_id="client-1",
+                                         action="view", resource_type=NOTE))
+    assert found == [ResourceRef(NOTE, "n-1")]
+    assert all(type(ref) is ResourceRef for ref in found)
+    assert gate.withheld(found, user_id="user-1", client_id="client-1", action="view") == set()
+    assert "h-1" not in repr(found)
+
+
 def test_the_parent_chain_is_not_read_while_nothing_is_unapplied(server, store):
     calls = []
 
