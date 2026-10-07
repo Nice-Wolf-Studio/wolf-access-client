@@ -199,13 +199,16 @@ class AccessGate:
     def filter(self, resource_ids: Iterable[str], *, user_id: str, client_id: str,
                action: str, resource_type: str,
                context: Mapping[str, Any] | None = None) -> list[str]:
-        """The ids, in order, the person may `action` under this mode. `off`
-        keeps them all. In `shadow` and `on` a resource with an outbox row
-        wolf-access has not applied (on itself or its parent chain) is left
-        out without asking (CUT-D1 (2), criterion 181; logged `shadow_deny` in
-        `shadow`). The rest are asked in batches of 1000: `shadow` keeps them
-        all (logging each deny), `on` keeps the allowed ones, and keeps none
-        if any batch gets no answer."""
+        """The ids, in order, the person may `action` under this mode.
+
+        - `off` keeps them all and asks nothing.
+        - `on` leaves out, without asking, every resource with an outbox row
+          wolf-access has not applied (on itself or its parent chain, CUT-D1
+          (2)); asks about the rest in batches of 1000 and keeps the allowed
+          ones; keeps none if any batch gets no answer.
+        - `shadow` never changes an answer: it keeps them all, like `off`, and
+          logs what `on` would leave out (`shadow_deny`, `reason=stale` or
+          `reason=decision`)."""
         ids = list(resource_ids)
         if self._mode is AccessMode.OFF or not ids:
             return ids
@@ -217,7 +220,7 @@ class AccessGate:
             reason = held.get(ResourceRef(resource_type, rid))
             if reason is None:
                 asked.append(rid)
-            elif reason == "outbox_unapplied" and self._mode is AccessMode.SHADOW:
+            elif reason == "stale" and self._mode is AccessMode.SHADOW:
                 self._shadow_deny({**where, "resource_id": rid}, reason)
         decisions = []
         try:
@@ -227,36 +230,34 @@ class AccessGate:
                     items=[EvaluationItem(action, resource_type, rid)
                            for rid in asked[start:start + MAX_EVALUATIONS]])
         except (WolfAccessError, ValueError) as exc:
-            if not self._no_answer(exc, where):
-                return []
-            return [rid for rid in ids
-                    if held.get(ResourceRef(resource_type, rid)) != "outbox_unapplied"]
+            return ids if self._no_answer(exc, where) else []
         if asked:
             self._decision_failure = None
-        shadow = self._mode is AccessMode.SHADOW
         answers = iter(decisions)
         kept = []
         for rid in ids:
-            reason = held.get(ResourceRef(resource_type, rid))
-            if reason is None:
-                if next(answers).allowed:
-                    kept.append(rid)
-                elif shadow:            # shadow enforces no decision: logged, kept
-                    self._shadow_deny({**where, "resource_id": rid}, "decision")
-                    kept.append(rid)
-            elif shadow and reason != "outbox_unapplied":
-                kept.append(rid)        # no answer (outbox_error): shadow proceeds
-        return kept
+            if ResourceRef(resource_type, rid) in held:
+                continue
+            if next(answers).allowed:
+                kept.append(rid)
+            elif self._mode is AccessMode.SHADOW:
+                self._shadow_deny({**where, "resource_id": rid}, "decision")
+        return ids if self._mode is AccessMode.SHADOW else kept
 
-    def withheld(self, resources: Iterable[ResourceRef]) -> set[ResourceRef]:
+    def withheld(self, resources: Iterable[ResourceRef], *, user_id: str | None = None,
+                 client_id: str | None = None,
+                 action: str | None = None) -> set[ResourceRef]:
         """Those of `resources` to leave out of a search, list or count now,
         for a service that filters with a gate of its own (a search result, a
-        provider's permitted set). In `shadow` and `on`: each with an outbox
-        row wolf-access has not applied, on itself or above it (CUT-D1 (2),
-        criterion 181; in `shadow`, log them as `shadow_deny`). In `on` also:
-        all of them after a restart until the restart gate opens, and all of
-        them when the outbox cannot be read (in `shadow` that call proceeds).
-        Always empty in `off`."""
+        provider's permitted set).
+
+        - `on`: each with an outbox row wolf-access has not applied, on itself
+          or above it (CUT-D1 (2)); all of them after a restart until the
+          restart gate opens; all of them when the outbox cannot be read.
+        - `shadow` never changes an answer: always empty. Each resource `on`
+          would leave out for stale data is logged as `shadow_deny`
+          (`reason=stale`), with `user_id`, `client_id` and `action` if given.
+        - `off`: always empty, and the outbox is not read."""
         refs = list(resources)
         if not all(isinstance(ref, ResourceRef) for ref in refs):
             raise ValueError("resources must be ResourceRef values")
@@ -264,7 +265,12 @@ class AccessGate:
             return set()
         held = self._held(refs)
         if self._mode is AccessMode.SHADOW:
-            return {ref for ref, reason in held.items() if reason == "outbox_unapplied"}
+            for ref, reason in held.items():
+                if reason == "stale":
+                    self._shadow_deny({"user_id": user_id, "client_id": client_id,
+                                       "action": action, "resource_type": ref.type,
+                                       "resource_id": ref.id}, reason)
+            return set()
         return set(held)
 
     # --- stale data and the restart gate (CUT-D1 (2)) ------------------------------------
@@ -283,7 +289,7 @@ class AccessGate:
         except Exception as exc:  # noqa: BLE001  (no answer from what cannot be read)
             self._outbox_error(exc)
             return dict.fromkeys(refs, "outbox_error")
-        return {ref: "outbox_unapplied" for ref, chain in chains.items()
+        return {ref: "stale" for ref, chain in chains.items()
                 if any(a in stale for a in chain)}
 
     def _chain(self, ref: ResourceRef) -> list[ResourceRef]:
@@ -307,7 +313,7 @@ class AccessGate:
         return False
 
     def _withhold(self, where: dict[str, Any], reason: str) -> bool:
-        if reason == "outbox_unapplied" and self._mode is AccessMode.SHADOW:
+        if reason == "stale" and self._mode is AccessMode.SHADOW:
             self._shadow_deny(where, reason)
         return self._mode is AccessMode.SHADOW
 
