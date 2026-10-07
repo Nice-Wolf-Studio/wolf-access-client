@@ -67,3 +67,26 @@ def test_package_ships_a_py_typed_marker():
     assert (ROOT / "wolf_access_client" / "py.typed").exists()
     assert 'package-data = {wolf_access_client = ["py.typed"]}' in (
         ROOT / "pyproject.toml").read_text()
+
+
+PUBLIC_API = {
+    # client and results
+    "WolfAccessClient", "Decision", "EvaluationItem", "SEMANTICS", "ResourceRef",
+    "PrincipalRef", "Permission", "Parent", "Written", "Pending",
+    # enforcement mode (CUT-D1)
+    "AccessMode", "AccessGate",
+    # errors
+    "WolfAccessError", "AccessUnavailable", "WolfAccessUnavailable",
+    "WolfAccessResponseError", "WolfAccessHTTPError", "DecisionRefused", "ProblemError",
+    "PROBLEM_TYPES", "OwnerRequiredError", "OwnershipMismatchError", "ConflictError",
+    "ForbiddenError", "NotFoundError", "BadRequestError", "UnauthorizedError",
+    "HttpsRequiredError", "RateLimitedError", "UnavailableError",
+    "IdempotencyKeyReusedError", "IdempotencyKeyInUseError",
+    "__version__",
+}
+
+
+def test_public_api_is_exported():
+    assert set(wolf_access_client.__all__) == PUBLIC_API
+    for name in PUBLIC_API:
+        assert hasattr(wolf_access_client, name), name
