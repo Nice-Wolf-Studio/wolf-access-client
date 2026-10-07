@@ -7,9 +7,24 @@ import socket
 import pytest
 
 from tests.fake_server import FakeWolfAccess, Reply
-from wolf_access_client import AccessGate, AccessMode, WolfAccessClient
+from wolf_access_client import AccessGate, AccessMode, OutboxProgress, WolfAccessClient
 
 CRED = "svc-credential-not-a-secret"
+
+
+class EmptyOutbox:
+    """An outbox with every row applied: these tests are about decisions."""
+    service = "wolfnotes"
+
+    def progress(self):
+        return OutboxProgress(last_sequence=0, applied_through=0, dead_letter=None)
+
+    def unapplied(self, resources):
+        return set()
+
+
+#: `shadow` and `on` need the outbox and the service's parent chain (CUT-D1 (2)).
+CUT = {"outbox": EmptyOutbox(), "ancestors": lambda ref: ()}
 EVAL, BATCH = "/access/v1/evaluation", "/access/v1/evaluations"
 LOGGER = "wolf_access_client"
 
@@ -108,8 +123,8 @@ def test_shadow_and_on_need_a_client(mode):
 
 def test_gate_accepts_a_mode_or_its_name(server):
     client = WolfAccessClient(server.url, CRED)
-    assert AccessGate("shadow", client).mode is AccessMode.SHADOW
-    assert AccessGate(AccessMode.ON, client).mode is AccessMode.ON
+    assert AccessGate("shadow", client, **CUT).mode is AccessMode.SHADOW
+    assert AccessGate(AccessMode.ON, client, **CUT).mode is AccessMode.ON
     assert AccessGate("off").mode is AccessMode.OFF
 
 
@@ -135,7 +150,7 @@ def test_off_keeps_today_s_behaviour_even_without_a_user_id():
 def test_shadow_deny_is_logged_and_allowed(server, caplog):
     caplog.set_level(logging.INFO, LOGGER)
     server.reply = Reply(body={"decision": False})
-    assert check(AccessGate("shadow", WolfAccessClient(server.url, CRED))) is True
+    assert check(AccessGate("shadow", WolfAccessClient(server.url, CRED), **CUT)) is True
     assert len(server.requests) == 1
     (record,) = events(caplog, "shadow_deny")
     assert record.levelno == logging.WARNING
@@ -147,14 +162,14 @@ def test_shadow_deny_is_logged_and_allowed(server, caplog):
 def test_shadow_allow_is_not_logged(server, caplog):
     caplog.set_level(logging.DEBUG, LOGGER)
     server.reply = Reply(body={"decision": True})
-    assert check(AccessGate("shadow", WolfAccessClient(server.url, CRED))) is True
+    assert check(AccessGate("shadow", WolfAccessClient(server.url, CRED), **CUT)) is True
     assert events(caplog, "shadow_deny") == []
 
 
 def test_shadow_with_wolf_access_unreachable_proceeds(dead_client, caplog):
     """CUT-D1: in shadow, an unreachable wolf-access does not block the call."""
     caplog.set_level(logging.INFO, LOGGER)
-    gate = AccessGate("shadow", dead_client)
+    gate = AccessGate("shadow", dead_client, **CUT)
     assert check(gate) is True
     assert keep(gate, ["n-1"]) == ["n-1"]
     assert len(events(caplog, "access_unavailable")) == 2
@@ -164,7 +179,7 @@ def test_shadow_filter_logs_each_deny_and_keeps_everything(server, caplog):
     caplog.set_level(logging.INFO, LOGGER)
     server.reply = Reply(body={"evaluations": [{"decision": True}, {"decision": False},
                                                {"decision": False}]})
-    gate = AccessGate("shadow", WolfAccessClient(server.url, CRED))
+    gate = AccessGate("shadow", WolfAccessClient(server.url, CRED), **CUT)
     assert keep(gate, ["n-1", "n-2", "n-3"]) == ["n-1", "n-2", "n-3"]
     assert [r.resource_id for r in events(caplog, "shadow_deny")] == ["n-2", "n-3"]
     assert server.requests[0].path == BATCH
@@ -173,7 +188,7 @@ def test_shadow_filter_logs_each_deny_and_keeps_everything(server, caplog):
 # --- on -------------------------------------------------------------------------------
 
 def test_on_enforces(server):
-    gate = AccessGate("on", WolfAccessClient(server.url, CRED))
+    gate = AccessGate("on", WolfAccessClient(server.url, CRED), **CUT)
     server.reply = Reply(body={"decision": True})
     assert check(gate) is True
     server.reply = Reply(body={"decision": False})
@@ -183,7 +198,7 @@ def test_on_enforces(server):
 
 def test_on_fails_closed_when_wolf_access_is_unreachable(dead_client, caplog):
     caplog.set_level(logging.INFO, LOGGER)
-    gate = AccessGate("on", dead_client)
+    gate = AccessGate("on", dead_client, **CUT)
     assert check(gate) is False
     assert keep(gate, ["n-1", "n-2"]) == []
     assert len(events(caplog, "access_unavailable")) == 2
@@ -192,7 +207,7 @@ def test_on_fails_closed_when_wolf_access_is_unreachable(dead_client, caplog):
 @pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
 def test_on_fails_closed_on_any_refusal(server, status):
     server.reply = Reply(status=status, raw=b"no", content_type="text/plain")
-    gate = AccessGate("on", WolfAccessClient(server.url, CRED))
+    gate = AccessGate("on", WolfAccessClient(server.url, CRED), **CUT)
     assert check(gate) is False
     assert keep(gate, ["n-1"]) == []
 
@@ -201,7 +216,7 @@ def test_on_fails_closed_on_any_refusal(server, status):
 def test_on_denies_a_call_without_a_user_id_or_client_id(server, missing, caplog):
     """A frame without a `user_id` fails closed; nothing is sent."""
     caplog.set_level(logging.INFO, LOGGER)
-    gate = AccessGate("on", WolfAccessClient(server.url, CRED))
+    gate = AccessGate("on", WolfAccessClient(server.url, CRED), **CUT)
     assert check(gate, **{missing: None}) is False
     assert keep(gate, ["n-1"], **{missing: None}) == []
     assert server.requests == []
@@ -210,7 +225,7 @@ def test_on_denies_a_call_without_a_user_id_or_client_id(server, missing, caplog
 
 def test_shadow_allows_a_call_without_a_user_id_and_logs_it(server, caplog):
     caplog.set_level(logging.INFO, LOGGER)
-    gate = AccessGate("shadow", WolfAccessClient(server.url, CRED))
+    gate = AccessGate("shadow", WolfAccessClient(server.url, CRED), **CUT)
     assert check(gate, user_id=None) is True
     assert server.requests == []
     assert len(events(caplog, "invalid_request")) == 1
@@ -219,7 +234,7 @@ def test_shadow_allows_a_call_without_a_user_id_and_logs_it(server, caplog):
 def test_on_filter_keeps_only_allowed_in_order(server):
     server.reply = Reply(body={"evaluations": [{"decision": False}, {"decision": True},
                                                {"decision": True}]})
-    gate = AccessGate("on", WolfAccessClient(server.url, CRED))
+    gate = AccessGate("on", WolfAccessClient(server.url, CRED), **CUT)
     assert keep(gate, ["n-3", "n-1", "n-2"]) == ["n-1", "n-2"]
     assert [e["resource"]["id"] for e in server.requests[0].body["evaluations"]] == [
         "n-3", "n-1", "n-2"]
@@ -227,7 +242,7 @@ def test_on_filter_keeps_only_allowed_in_order(server):
 
 
 def test_on_filter_of_nothing_sends_nothing(server):
-    assert keep(AccessGate("on", WolfAccessClient(server.url, CRED)), []) == []
+    assert keep(AccessGate("on", WolfAccessClient(server.url, CRED), **CUT), []) == []
     assert server.requests == []
 
 
@@ -236,7 +251,7 @@ def test_filter_splits_more_than_1000_ids_into_batches(server):
                  Reply(body={"evaluations": [{"decision": False}] * 499 +
                              [{"decision": True}]}))
     ids = [str(i) for i in range(1500)]
-    assert keep(AccessGate("on", WolfAccessClient(server.url, CRED)), ids) == \
+    assert keep(AccessGate("on", WolfAccessClient(server.url, CRED), **CUT), ids) == \
         ids[:1000] + ["1499"]
     assert [len(r.body["evaluations"]) for r in server.requests] == [1000, 500]
 
@@ -244,13 +259,13 @@ def test_filter_splits_more_than_1000_ids_into_batches(server):
 def test_filter_fails_closed_if_any_batch_fails(server):
     server.queue("POST", BATCH, Reply(body={"evaluations": [{"decision": True}] * 1000}),
                  Reply(status=503, raw=b"no", content_type="text/plain"))
-    gate = AccessGate("on", WolfAccessClient(server.url, CRED))
+    gate = AccessGate("on", WolfAccessClient(server.url, CRED), **CUT)
     assert keep(gate, [str(i) for i in range(1001)]) == []
 
 
 def test_check_passes_extra_context(server):
     server.reply = Reply(body={"decision": True})
-    check(AccessGate("on", WolfAccessClient(server.url, CRED)),
+    check(AccessGate("on", WolfAccessClient(server.url, CRED), **CUT),
           context={"review_case": "case-1"})
     assert server.requests[0].body["context"] == {"client_id": "client-1",
                                                   "review_case": "case-1"}

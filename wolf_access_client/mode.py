@@ -8,9 +8,13 @@ thing everywhere.
 - `on`: enforced. A deny is a deny, and so is every failure to get an
   answer (CLI-P2, fail closed).
 
-The mode switches only the decision path. The lifecycle outbox, intent
-checks and ownership feed of CUT-D1 (1), (3) and (4) run in every mode and
-arrive with wolf-access M1c (see README, "Not yet").
+The mode switches only the decision path. The lifecycle outbox of CUT-D1 (1)
+(`outbox.py`, `relay.py`) runs in every mode. In `shadow` and `on` the gate
+also gives no answer from stale data (CUT-D1 (2)): it asks the outbox store
+which resources still have a row wolf-access has not applied, and after a
+restart in `on` it answers nothing until the rows written before start-up are
+applied. Intent checks (3) and the ownership feed (4) arrive with wolf-access
+M1c-2 and M1c-3 (see README, "Seams").
 """
 
 from __future__ import annotations
@@ -18,16 +22,27 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .client import MAX_EVALUATIONS, WolfAccessClient
-from .errors import AccessUnavailable, WolfAccessError
-from .models import EvaluationItem
+from .errors import AccessUnavailable, SeedNotVerified, WolfAccessError
+from .models import EvaluationItem, OutboxProgress, ResourceRef
 
 log = logging.getLogger("wolf_access_client")
 
 _SERVICE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def safe(value: Any) -> str:
+    """`value` as text for a log message, every control character (line
+    breaks included) escaped, so no logged field can start a log line of its
+    own (CWE-117, #29). Structured `extra` fields keep the raw value."""
+    text = value if isinstance(value, str) else str(value)
+    return _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()) if ord(m.group()) < 0x100
+                        else "\\u%04x" % ord(m.group()), text)
 
 
 class AccessMode(str, Enum):
@@ -66,22 +81,97 @@ class AccessMode(str, Enum):
             raise ValueError(f"{name}={env[name]!r} is not one of off, shadow, on") from None
 
 
+@dataclass(frozen=True)
+class GateHealth:
+    """What a service puts on its `/health` for the gate (#28; its HTTP status
+    stays 200): `ok`, or `degraded` with a `reason`:
+
+    - `unavailable`: the last decision call got no answer (CLI-P2);
+    - `seed_not_verified`: wolf-access answers no decision until the
+      service's seed is verified (CUT-D1);
+    - `outbox_error`: the outbox store or the parent chain could not be read;
+    - `restart_gate`: `on` after a restart, waiting for wolf-access to apply
+      the rows written before start-up (CUT-D1 (2))."""
+
+    status: str
+    reason: str | None = None
+
+    def as_dict(self) -> dict[str, str]:
+        return {"status": self.status} if self.reason is None else \
+            {"status": self.status, "reason": self.reason}
+
+
+_OK = GateHealth("ok")
+
+
 class AccessGate:
     """Decisions under an enforcement mode. Build it once at start-up:
-    `AccessGate(AccessMode.from_env("wolfnotes"), client)`. An unknown mode is
-    refused here, and `shadow` and `on` need a client."""
+
+        AccessGate(AccessMode.from_env("wolfnotes"), client, outbox=store,
+                   ancestors=parent_chain)
+
+    An unknown mode is refused here. `shadow` and `on` need a client, the
+    service's `OutboxStore` (`outbox`) and `ancestors`, a callable giving the
+    service's own parent chain of a resource (its parent, the parent's
+    parent, ...: `ResourceRef`s; `lambda ref: ()` for types without parents).
+    The chain is read only while some row is unapplied. `off` needs none of
+    them and never reads the outbox."""
 
     def __init__(self, mode: AccessMode | str, client: WolfAccessClient | None = None, *,
+                 outbox: Any = None,
+                 ancestors: Callable[[ResourceRef], Iterable[ResourceRef]] | None = None,
                  logger: logging.Logger | None = None) -> None:
         self._mode = AccessMode.parse(mode)
-        if self._mode is not AccessMode.OFF and not isinstance(client, WolfAccessClient):
-            raise ValueError(f"mode {self._mode.value} needs a WolfAccessClient")
         self._client = client
+        self._outbox = outbox
+        self._ancestors = ancestors
         self._log = logger or log
+        self._decision_failure: str | None = None
+        self._outbox_failure = False
+        self._restart_open = self._mode is not AccessMode.ON
+        self._restart_waited = False
+        self._startup: int | None = None
+        if self._mode is AccessMode.OFF:
+            return
+        name = self._mode.value
+        if not isinstance(client, WolfAccessClient):
+            raise ValueError(f"mode {name} needs a WolfAccessClient")
+        if outbox is None or not callable(getattr(outbox, "progress", None)) \
+                or not callable(getattr(outbox, "unapplied", None)):
+            raise ValueError(f"mode {name} needs outbox=, the service's OutboxStore: no "
+                             "answer is given from stale data (CUT-D1 (2))")
+        if not callable(ancestors):
+            raise ValueError(f"mode {name} needs ancestors=, the service's own parent chain "
+                             "of a resource (lambda ref: () for types without parents)")
+        if self._mode is AccessMode.ON:
+            try:
+                self._startup = outbox.progress().last_sequence     # the restart gate's mark
+            except Exception as exc:  # noqa: BLE001  (the first read that works sets it)
+                self._outbox_error(exc)
 
     @property
     def mode(self) -> AccessMode:
         return self._mode
+
+    @property
+    def health(self) -> GateHealth:
+        """`ok`, or `degraded` with its reason (see `GateHealth`). Never raises."""
+        if self._mode is AccessMode.OFF:
+            return _OK
+        if not self._restart_open:
+            try:
+                progress = self._outbox.progress()
+                self._outbox_failure = False
+                self._restart_gate_open(progress)
+            except Exception as exc:  # noqa: BLE001
+                self._outbox_error(exc)
+        if self._outbox_failure:
+            return GateHealth("degraded", "outbox_error")
+        if not self._restart_open:
+            return GateHealth("degraded", "restart_gate")
+        if self._decision_failure:
+            return GateHealth("degraded", self._decision_failure)
+        return _OK
 
     def check(self, *, user_id: str, client_id: str, action: str, resource_type: str,
               resource_id: str, context: Mapping[str, Any] | None = None) -> bool:
@@ -90,14 +180,19 @@ class AccessGate:
             return True
         where = {"user_id": user_id, "client_id": client_id, "action": action,
                  "resource_type": resource_type, "resource_id": resource_id}
+        ref = ResourceRef(resource_type, resource_id)
+        reason = self._held([ref]).get(ref)
+        if reason is not None:
+            return self._withhold(where, reason)
         try:
             allowed = self._client.evaluation(context=context, **where).allowed  # type: ignore[union-attr]
         except (WolfAccessError, ValueError) as exc:
             return self._no_answer(exc, where)
+        self._decision_failure = None
         if allowed:
             return True
         if self._mode is AccessMode.SHADOW:
-            self._shadow_deny(where)
+            self._shadow_deny(where, "decision")
             return True
         return False
 
@@ -105,43 +200,130 @@ class AccessGate:
                action: str, resource_type: str,
                context: Mapping[str, Any] | None = None) -> list[str]:
         """The ids, in order, the person may `action` under this mode (`off`
-        and `shadow` keep them all). Asks in batches of 1000; if any batch
-        gets no answer, `on` keeps none."""
+        and `shadow` keep them all). Resources with an unapplied outbox row
+        are left out in `on` without asking; the rest are asked in batches of
+        1000, and if any batch gets no answer, `on` keeps none."""
         ids = list(resource_ids)
         if self._mode is AccessMode.OFF or not ids:
             return ids
         where = {"user_id": user_id, "client_id": client_id, "action": action,
                  "resource_type": resource_type}
+        held = self._held([ResourceRef(resource_type, rid) for rid in ids])
+        asked = []
+        for rid in ids:
+            reason = held.get(ResourceRef(resource_type, rid))
+            if reason is None:
+                asked.append(rid)
+            elif reason == "outbox_unapplied" and self._mode is AccessMode.SHADOW:
+                self._shadow_deny({**where, "resource_id": rid}, reason)
         decisions = []
         try:
-            for start in range(0, len(ids), MAX_EVALUATIONS):
+            for start in range(0, len(asked), MAX_EVALUATIONS):
                 decisions += self._client.evaluations(  # type: ignore[union-attr]
                     user_id=user_id, client_id=client_id, context=context,
                     items=[EvaluationItem(action, resource_type, rid)
-                           for rid in ids[start:start + MAX_EVALUATIONS]])
+                           for rid in asked[start:start + MAX_EVALUATIONS]])
         except (WolfAccessError, ValueError) as exc:
             return ids if self._no_answer(exc, where) else []
+        if asked:
+            self._decision_failure = None
+        answers = iter(decisions)
         kept = []
-        for rid, decision in zip(ids, decisions, strict=True):
-            if decision.allowed:
+        for rid in ids:
+            if ResourceRef(resource_type, rid) in held:
+                continue
+            if next(answers).allowed:
                 kept.append(rid)
             elif self._mode is AccessMode.SHADOW:
-                self._shadow_deny({**where, "resource_id": rid})
+                self._shadow_deny({**where, "resource_id": rid}, "decision")
         return ids if self._mode is AccessMode.SHADOW else kept
 
-    def _shadow_deny(self, where: dict[str, Any]) -> None:
+    def withheld(self, resources: Iterable[ResourceRef]) -> set[ResourceRef]:
+        """Those of `resources` that must get no answer now, for a service
+        that filters with a gate of its own (a search result, a provider's
+        permitted set): in `shadow` and `on`, each with an outbox row
+        wolf-access has not applied (on itself or above it); in `on` after a
+        restart, all of them until the restart gate opens; all of them when
+        the outbox cannot be read. Drop them in `on`; log them in `shadow`.
+        Always empty in `off`."""
+        refs = list(resources)
+        if not all(isinstance(ref, ResourceRef) for ref in refs):
+            raise ValueError("resources must be ResourceRef values")
+        if self._mode is AccessMode.OFF:
+            return set()
+        return set(self._held(refs))
+
+    # --- stale data and the restart gate (CUT-D1 (2)) ------------------------------------
+
+    def _held(self, refs: list[ResourceRef]) -> dict[ResourceRef, str]:
+        """Each of `refs` that gets no answer now, with the reason."""
+        try:
+            progress: OutboxProgress = self._outbox.progress()
+            self._outbox_failure = False
+            if not self._restart_gate_open(progress):
+                return dict.fromkeys(refs, "restart_gate")
+            if progress.applied_through >= progress.last_sequence:
+                return {}
+            chains = {ref: [ref, *self._chain(ref)] for ref in dict.fromkeys(refs)}
+            stale = self._outbox.unapplied({a for chain in chains.values() for a in chain})
+        except Exception as exc:  # noqa: BLE001  (no answer from what cannot be read)
+            self._outbox_error(exc)
+            return dict.fromkeys(refs, "outbox_error")
+        return {ref: "outbox_unapplied" for ref, chain in chains.items()
+                if any(a in stale for a in chain)}
+
+    def _chain(self, ref: ResourceRef) -> list[ResourceRef]:
+        chain = list(self._ancestors(ref))  # type: ignore[misc]
+        if not all(isinstance(a, ResourceRef) for a in chain):
+            raise ValueError("ancestors must give ResourceRef values")
+        return chain
+
+    def _restart_gate_open(self, progress: OutboxProgress) -> bool:
+        if self._restart_open:
+            return True
+        if self._startup is None:
+            self._startup = progress.last_sequence
+        if progress.applied_through >= self._startup and progress.dead_letter is None:
+            self._restart_open = True
+            if self._restart_waited:
+                self._log.info("restart_gate_open applied_through=%d", progress.applied_through,
+                               extra={"event": "restart_gate_open"})
+            return True
+        self._restart_waited = True
+        return False
+
+    def _withhold(self, where: dict[str, Any], reason: str) -> bool:
+        if reason == "outbox_unapplied" and self._mode is AccessMode.SHADOW:
+            self._shadow_deny(where, reason)
+        return self._mode is AccessMode.SHADOW
+
+    def _outbox_error(self, exc: Exception) -> None:
+        self._outbox_failure = True
+        self._log.warning("outbox_error mode=%s error=%s", self._mode.value, type(exc).__name__,
+                          extra={"event": "outbox_error", "mode": self._mode.value,
+                                 "error": type(exc).__name__})
+
+    # --- logging -----------------------------------------------------------------------------
+
+    def _shadow_deny(self, where: dict[str, Any], reason: str) -> None:
         self._log.warning(
-            "shadow_deny user_id=%s client_id=%s action=%s resource=%s:%s",
-            where["user_id"], where["client_id"], where["action"], where["resource_type"],
-            where["resource_id"], extra={"event": "shadow_deny", **where})
+            "shadow_deny user_id=%s client_id=%s action=%s resource=%s:%s reason=%s",
+            safe(where["user_id"]), safe(where["client_id"]), safe(where["action"]),
+            safe(where["resource_type"]), safe(where["resource_id"]), reason,
+            extra={"event": "shadow_deny", "reason": reason, **where})
 
     def _no_answer(self, exc: Exception, where: dict[str, Any]) -> bool:
         """Log a check that got no decision; True if the mode lets it through."""
-        event = "access_unavailable" if isinstance(exc, AccessUnavailable) else \
-            "invalid_request" if isinstance(exc, ValueError) else "access_error"
+        if isinstance(exc, ValueError):
+            event = "invalid_request"
+        else:
+            event = "seed_not_verified" if isinstance(exc, SeedNotVerified) else \
+                "access_unavailable" if isinstance(exc, AccessUnavailable) else "access_error"
+            self._decision_failure = "seed_not_verified" if isinstance(exc, SeedNotVerified) \
+                else "unavailable"
         self._log.warning("%s mode=%s error=%s action=%s resource_type=%s", event,
-                          self._mode.value, type(exc).__name__, where["action"],
-                          where["resource_type"],
+                          self._mode.value, type(exc).__name__, safe(where["action"]),
+                          safe(where["resource_type"]),
                           extra={"event": event, "mode": self._mode.value,
                                  "error": type(exc).__name__, **where})
         return self._mode is AccessMode.SHADOW

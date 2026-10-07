@@ -5,6 +5,7 @@
     │   ├── WolfAccessUnavailable        unreachable, timeout, TLS failure, broken HTTP
     │   ├── WolfAccessResponseError      a success status with a malformed or oversized body
     │   └── DecisionRefused              any status but 200 from the decision API
+    │       └── SeedNotVerified          409: the service's seed is not verified (CUT-D1)
     └── WolfAccessHTTPError              wolf-access answered with an error status
         ├── DecisionRefused              (also an AccessUnavailable, above)
         └── ProblemError                 an RFC 9457 problem from the write API (/v1)
@@ -89,6 +90,14 @@ class DecisionRefused(AccessUnavailable, WolfAccessHTTPError):
     not kept."""
 
 
+class SeedNotVerified(DecisionRefused):
+    """409 from the decision API: the service has reported an enforcement
+    mode (`report_state`) and its seed is not verified yet, so wolf-access
+    answers none of its decisions (CUT-D1, API-D10 (d)). No decision: `on`
+    denies, `shadow` blocks nothing. Not retryable as such: it lasts until
+    the seed is verified."""
+
+
 class ProblemError(WolfAccessHTTPError):
     """An RFC 9457 problem from the write API (`/v1`, API-D3). `name` is the
     part after `urn:wolfaccess:problem:` (None for a problem from elsewhere);
@@ -171,16 +180,29 @@ class IdempotencyKeyReusedError(ProblemError):
 
 
 class IdempotencyKeyInUseError(ProblemError):
-    """409: a request with this `Idempotency-Key` is still running."""
+    """409: a request with this `Idempotency-Key` is still running. Retryable:
+    once it finishes, the same request gets its answer (#25)."""
     problem_name = "idempotency_key_in_use"
+
+    @property
+    def retryable(self) -> bool:  # type: ignore[override]
+        return True
+
+
+class UseOutboxError(ProblemError):
+    """409: this service has reported an enforcement mode, so its resources
+    change only through its lifecycle outbox (`OutboxStore`, CUT-D1 (1));
+    direct `POST`/`PATCH`/`DELETE /v1/resources` are refused."""
+    problem_name = "use_outbox"
 
 
 #: Problem name -> exception class. A name missing here (a later milestone's,
-#: such as `under_review`) is raised as a plain `ProblemError` with its name.
+#: such as `under_review` or `behind`) is raised as a plain `ProblemError`
+#: with its name.
 PROBLEM_TYPES: dict[str, type[ProblemError]] = {
     cls.problem_name: cls for cls in (
         OwnerRequiredError, OwnershipMismatchError, ConflictError, ForbiddenError,
         NotFoundError, BadRequestError, UnauthorizedError, HttpsRequiredError,
         RateLimitedError, UnavailableError, IdempotencyKeyReusedError,
-        IdempotencyKeyInUseError)
+        IdempotencyKeyInUseError, UseOutboxError)
 }

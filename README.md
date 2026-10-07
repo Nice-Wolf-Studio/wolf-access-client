@@ -3,7 +3,9 @@
 The Python client library for **wolf-access**, the Nice-Wolf-Studio authorization service.
 A service embeds it to ask wolf-access whether the person behind a call may see or change one of
 the service's resources, to filter lists and search results down to what that person may see,
-and to register its resource types and resources.
+to register its resource types and resources, and, for a service that existed before
+wolf-access (WolfNotes, finOps), to cut over: a lifecycle outbox in the service's own database,
+a relay that delivers it, and an `off` / `shadow` / `on` gate.
 
 ## Install
 
@@ -12,10 +14,11 @@ Install it by release tag, the same way as
 is needed:
 
 ```bash
-pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.2.0"
+pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.3.0"
 ```
 
-Python 3.10+, standard library only.
+Python 3.10+, standard library only. The Postgres outbox store works over the DB-API driver
+the service already uses (psycopg2 or psycopg 3); the library does not depend on one.
 
 ## What is public and what is not
 
@@ -37,7 +40,16 @@ Python 3.10+, standard library only.
 | `create_resource(...)` | `POST /v1/resources` | `Written` or `Pending` |
 | `update_resource(...)` | `PATCH /v1/resources/{type}/{id}` | `Written` or `Pending` |
 | `delete_resource(...)` | `DELETE /v1/resources/{type}/{id}` | `Written` or `Pending` |
-| `AccessMode`, `AccessGate` | (none: local) | the `off` / `shadow` / `on` switch (CUT-D1) |
+| `report_state(mode, registration_start)` | `PUT /v1/services/{service}/state` | `None` |
+| `send_changes(rows)` | `POST /v1/services/{service}/changes` | `ChangesAnswer` |
+| `changes_page(after)` | `GET /v1/services/{service}/changes?after=n` | `ChangesAnswer` (one page, at most 1000 rows) |
+| `changes_since(after)` | `GET …/changes?after=n`, every page | iterator of `ChangeResult`, oldest first |
+| `OutboxStore.append(conn, change)` | (none: the service's own database) | `OutboxRow` with the next sequence number |
+| `OutboxRelay` | the state report, then `POST …/changes` in sequence | `.state`: `ok`, `behind`, `refused`, `unavailable` |
+| `AccessMode`, `AccessGate` | `/access/v1` (except in `off`) | the `off` / `shadow` / `on` switch (CUT-D1); `.health` |
+
+The cut-over calls need the client's service name: `WolfAccessClient(url, credential,
+service="wolfnotes")`. They are accepted only with that service's own credential.
 
 ## A consumer `PermissionProvider`
 
@@ -47,7 +59,7 @@ their own mode handling; a provider for them only has to answer, and **raise whe
 which their gates treat as deny:
 
 ```python
-from wolf_access_client import EvaluationItem, WolfAccessClient
+from wolf_access_client import AccessGate, EvaluationItem, ResourceRef, WolfAccessClient
 
 NOTE = "wolfnotes/note"
 
@@ -55,43 +67,55 @@ NOTE = "wolfnotes/note"
 class WolfAccessProvider:
     """WolfNotes' PermissionProvider, backed by wolf-access."""
 
-    def __init__(self, client: WolfAccessClient) -> None:
+    def __init__(self, client: WolfAccessClient, gate: AccessGate) -> None:
         self._client = client
+        self._gate = gate       # only for gate.withheld: WolfNotes applies its own mode
 
     def permitted_note_ids(self, user_id, client_id):
         # The list-filter (CLI-3): every page, or an exception. Never a partial set.
-        return frozenset(ref.id for ref in self._client.search_resources(
+        refs = list(self._client.search_resources(
             user_id=user_id, client_id=client_id, action="view", resource_type=NOTE))
+        held = self._gate.withheld(refs)    # no answer from stale data (CUT-D1 (2))
+        return frozenset(ref.id for ref in refs if ref not in held)
 
     def can_view(self, user_id, client_id, note_id):
+        if self._gate.withheld([ResourceRef(NOTE, note_id)]):
+            return False
         return self._client.evaluation(
             user_id=user_id, client_id=client_id, action="view",
             resource_type=NOTE, resource_id=note_id).allowed
 
     def visible(self, user_id, client_id, note_ids):
         # Not part of the protocol: one call for up to 1000 candidates (e.g. search hits).
-        note_ids = list(note_ids)
+        held = self._gate.withheld([ResourceRef(NOTE, n) for n in note_ids])
+        note_ids = [n for n in note_ids if ResourceRef(NOTE, n) not in held]
+        if not note_ids:
+            return []
         decisions = self._client.evaluations(
             user_id=user_id, client_id=client_id,
             items=[EvaluationItem("view", NOTE, n) for n in note_ids])
         return [n for n, d in zip(note_ids, decisions) if d.allowed]
 
 
-client = WolfAccessClient("https://<wolf-access host>", service_credential)
-provider = WolfAccessProvider(client)
+client = WolfAccessClient("https://<wolf-access host>", service_credential,
+                          service="wolfnotes")
+provider = WolfAccessProvider(client, gate)   # gate: see "Cut-over" below
 ```
 
 `user_id` and `client_id` are always the gateway `Caller`'s, taken from the frame of the call
 being served, never from a tool argument (API-D8, CLI-P1). A `None` from a legacy frame is a
 `ValueError` before anything is sent, so it fails closed too.
 
-A service without a gate of its own uses `AccessGate`, which applies the mode for it:
+A service without a gate of its own uses `AccessGate`, which applies the mode for it (see
+"Cut-over" below for the outbox and the parent chain it needs in `shadow` and `on`):
 
 ```python
 from wolf_access_client import AccessGate, AccessMode, WolfAccessClient
 
 gate = AccessGate(AccessMode.from_env("myservice"),       # reads MYSERVICE_ACCESS_MODE
-                  WolfAccessClient("https://<wolf-access host>", service_credential))
+                  WolfAccessClient("https://<wolf-access host>", service_credential,
+                                   service="myservice"),
+                  outbox=store, ancestors=lambda ref: ())
 
 if not gate.check(user_id=caller.user_id, client_id=caller.client_id, action="view",
                   resource_type="myservice/thing", resource_id=thing_id):
@@ -140,6 +164,7 @@ caller treats as deny / "not found". It is never confused with a real deny:
 | Unreachable, timeout, TLS failure, broken HTTP | `WolfAccessUnavailable` (cause chained) |
 | A 200 that is malformed, misaligned, or over the size limit | `WolfAccessResponseError` |
 | Any other status: 400, 401, 403, 429, 5xx, a redirect (never followed) | `DecisionRefused` (`.status`, `.retry_after`) |
+| 409: the service reported a mode and its seed is not verified yet (CUT-D1) | `SeedNotVerified`, a `DecisionRefused` |
 
 All three are subclasses of `AccessUnavailable`. AuthZEN error bodies are plain text and are not
 kept: no exception carries text the server sent.
@@ -197,7 +222,8 @@ client.delete_resource("wolfnotes/note", note_id)                 # the id stays
 Each write returns:
 
 - `Written(zedtoken)` for 200 or 201. The client records the token and sends it with the
-  decisions that follow.
+  decisions that follow. wolf-access answers an empty token while it holds no watermark yet:
+  that is `Written(None)`, the write happened, and the client keeps the token it already had.
 - `Pending()` for 202 `{"status": "pending"}`: committed, but its relationships are not applied
   yet, and wolf-access fails every check closed until they are.
 
@@ -227,9 +253,12 @@ and `.retryable`.
 | `rate_limited` | 429 | `RateLimitedError` | yes, after `.retry_after` |
 | `unavailable` | 503 | `UnavailableError` | yes, after `.retry_after`; nothing was stored |
 | `idempotency_key_reused` | 422 | `IdempotencyKeyReusedError` | no |
-| `idempotency_key_in_use` | 409 | `IdempotencyKeyInUseError` | no |
+| `idempotency_key_in_use` | 409 | `IdempotencyKeyInUseError` | yes: the first request is still running; once it ends, the same request gets its answer |
+| `use_outbox` | 409 | `UseOutboxError` | no: the service has a mode; change resources through its outbox |
 
 - A name this version has no class for arrives as a plain `ProblemError` with its `.name`.
+  A name is kept only if it is a plain `[a-z][a-z0-9_]{0,63}`; anything else is `.name = None`,
+  so the server never controls `str(exc)`.
 - An error that is not a problem document (an edge proxy's HTML page) is a plain
   `WolfAccessHTTPError`.
 - A write that got no answer at all is `WolfAccessUnavailable`: its outcome is unknown, and it
@@ -243,24 +272,207 @@ WolfAccessError
 │   ├── WolfAccessUnavailable
 │   ├── WolfAccessResponseError
 │   └── DecisionRefused          (also a WolfAccessHTTPError)
+│       └── SeedNotVerified      409 from the seed gate
 └── WolfAccessHTTPError
     └── ProblemError
-        └── OwnerRequiredError, ConflictError, UnavailableError, ...
+        └── OwnerRequiredError, ConflictError, UseOutboxError, UnavailableError, ...
 ```
 
-## Enforcement mode (CUT-D1)
+## Cut-over: integrating a service that existed before wolf-access (CUT-D1)
 
-`AccessMode` is `off`, `shadow` or `on`, and `AccessGate(mode, client)` applies it:
+WolfNotes and finOps keep their own records and add wolf-access underneath them. Three pieces do
+that, and the service wires all three at start-up:
+
+| Piece | What it does | Runs in |
+|---|---|---|
+| **Outbox** (`OutboxStore`) | Every resource lifecycle change is written to the service's own database, in the same transaction as the change, with the next number of a gapless per-service sequence. | every mode, `off` included |
+| **Relay** (`OutboxRelay`) | Reports the service's state at start-up, then sends the outbox to wolf-access in sequence and records each row's result. | every mode, `off` included |
+| **Gate** (`AccessGate`) | Applies the mode to decisions, and gives no answer from stale data. | the decision path |
+
+### 1. The outbox: what to append, and when
+
+Append a `Change` for **every** lifecycle change of one of the service's own resources:
+
+| The service... | Append |
+|---|---|
+| files a new resource | `Change.create(ref, owner=PrincipalRef.user(caller.user_id), author=caller.user_id, parent=..., private=...)` |
+| moves or re-parents it | `Change.move(ref, parent=new_parent_ref)` (`parent=None`: to the root) |
+| makes it private or public | `Change.set_private(ref, True)` |
+| deletes it (or confirms a purge) | `Change.delete(ref)` |
+
+`ref` is `ResourceRef("<service>/<type>", id)`, the same id the service uses on decisions.
+`owner` and `author` are the ones the filing settled (OWN-2, OWN-3, OWN-D5), never a tool
+argument. Owner changes never go in the outbox: they are made in wolf-access (CUT-D1 (4),
+wolf-access M1c-3).
+
+**The transaction boundary.** `append` writes through the connection you pass, inside the
+transaction you already have open, and never commits. Commit (or roll back) the change and its
+outbox row together:
+
+```python
+import sqlite3
+from wolf_access_client import Change, PrincipalRef, ResourceRef, SQLiteOutboxStore
+
+store = SQLiteOutboxStore(lambda: sqlite3.connect(DB_PATH, timeout=30), "wolfnotes")
+store.create_schema()                       # once; or put store.DDL in your migrations
+
+def move_note(conn, note_id, folder_id, caller):
+    with conn:                              # one transaction: both or neither
+        conn.execute("UPDATE notes SET folder_id = ? WHERE id = ?", (folder_id, note_id))
+        store.append(conn, Change.move(ResourceRef("wolfnotes/note", note_id),
+                                       parent=ResourceRef("wolfnotes/folder", folder_id)))
+    relay.wake()                            # optional: send it now, not at the next poll
+```
+
+```python
+import psycopg2
+from wolf_access_client import Change, PostgresOutboxStore, ResourceRef
+
+store = PostgresOutboxStore(lambda: psycopg2.connect(DSN), "finops")
+
+with conn:                                  # psycopg2: commit on success, roll back on error
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
+        store.append(cur, Change.delete(ResourceRef("finops/account", account_id)))
+```
+
+- A rolled-back transaction removes the row and gives its number back: the sequence stays
+  gapless. Concurrent transactions queue on the service's sequence row until each commits, so
+  rows always commit in sequence order.
+- A `Change` is checked when it is built (a create needs `owner` and `author`, a move needs
+  `parent`, a `private` change needs the flag), and `append` refuses another service's type, so
+  a change wolf-access could only refuse for its shape never enters the sequence.
+- Never edit or delete outbox rows by hand: the sequence is the contract with wolf-access.
+
+**The tables.** `create_schema()` creates them if missing; to manage them in your own
+migrations, use `PostgresOutboxStore.DDL` / `SQLiteOutboxStore.DDL`. On Postgres:
+
+```sql
+CREATE TABLE IF NOT EXISTS wolf_access_outbox_state (
+    service            text        PRIMARY KEY,
+    last_sequence      bigint      NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
+    applied_through    bigint      NOT NULL DEFAULT 0 CHECK (applied_through >= 0),
+    registration_start timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS wolf_access_outbox (
+    service       text        NOT NULL REFERENCES wolf_access_outbox_state (service),
+    sequence      bigint      NOT NULL CHECK (sequence >= 1),
+    change_id     text        NOT NULL,
+    action        text        NOT NULL,
+    resource_type text        NOT NULL,
+    resource_id   text        NOT NULL,
+    body          jsonb       NOT NULL,     -- the row exactly as it is sent
+    status        text        NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending', 'held', 'refused', 'applied', 'resolved')),
+    reason        text,                     -- wolf-access's reason for held / refused
+    created_at    timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    answered_at   timestamptz,
+    PRIMARY KEY (service, sequence),
+    UNIQUE (service, change_id)
+);
+CREATE INDEX IF NOT EXISTS wolf_access_outbox_resource
+    ON wolf_access_outbox (service, resource_type, resource_id);
+```
+
+`wolf_access_outbox_state` has one row per service: the sequence counter, `applied_through`
+(every row up to it is applied in wolf-access) and the **registration start**, the moment the
+service first ran the library (CUT-D1), recorded once.
+
+A store of your own implements `OutboxStore`: `append(conn, change, *, change_id=None)`,
+`unapplied_rows(limit)`, `record(answer)`, `unapplied(resources)`, `progress()` and
+`registration_start()`, with the same gapless and transactional guarantees.
+
+### 2. The relay: a background task
+
+```python
+from wolf_access_client import AccessMode, OutboxRelay, WolfAccessClient
+
+mode = AccessMode.from_env("wolfnotes")                     # WOLFNOTES_ACCESS_MODE
+client = WolfAccessClient(WOLF_ACCESS_URL, credential, service="wolfnotes")
+relay = OutboxRelay(client, store, mode=mode)
+relay.start()                                               # a daemon thread
+...
+relay.stop(timeout=10)                                      # at shutdown
+```
+
+In an asyncio service, run it on a worker thread instead: `task =
+asyncio.create_task(asyncio.to_thread(relay.run_forever))`, and `relay.stop()` at shutdown.
+Run **one** relay per service process that writes the outbox; a second one is harmless (every
+row is idempotent) but wasteful.
+
+What it does, step by step:
+
+1. **State report** (CUT-D1, CUT-S1): `PUT /v1/services/{service}/state` with the mode and the
+   store's registration start, at every start-up, in every mode, retried until it succeeds.
+   From the first report on, wolf-access refuses the service's direct `POST`/`PATCH`/`DELETE
+   /v1/resources` (`UseOutboxError`) and answers its decisions only once its seed is verified.
+2. **Delivery in sequence**: the unapplied rows from the head of the sequence, at most 500 per
+   `POST`, and every row's result recorded in the store. A row wolf-access already applied is
+   answered with its stored result and changes nothing, so sending again is always safe, also
+   across restarts.
+3. **Held** rows (a resource wolf-access does not know yet waits for the seed import; a row with
+   a gap before it waits for the gap) are sent again every `held_interval` (30 s).
+4. **Refused** rows are dead-lettered: the row stays at the head, every later row waits behind
+   it, an ERROR is logged once (`event=outbox_refused`, with the sequence and wolf-access's
+   reason) and `relay.state` is `refused`. It is never sent again on its own. Fix the cause,
+   then call `relay.retry_refused()` (one more delivery). Meanwhile the relay polls `GET
+   …/changes` every `refused_interval` (60 s), so a row reconcile resolves is picked up.
+5. **Failures**: on 408, 429, 5xx, a network error or a malformed answer it backs off
+   exponentially with jitter (1 s up to 300 s) and never retries before a `Retry-After`. Any
+   other refusal (a wrong credential or service name) waits 300 s and is logged as an error;
+   the rows are kept, so fixing the configuration needs no restart.
+
+`relay.wake()` runs the next step now (call it after a commit); a backoff or `Retry-After` still
+holds. With nothing to send the relay checks the store every `idle_interval` (2 s).
+
+### 3. The gate
+
+```python
+from wolf_access_client import AccessGate, ResourceRef
+
+def parent_chain(ref):                      # the service's own parents, nearest first
+    folder = folder_of(ref.id)              # your database
+    return [ResourceRef("wolfnotes/folder", f) for f in folder_and_its_ancestors(folder)]
+
+gate = AccessGate(mode, client, outbox=store, ancestors=parent_chain)
+```
+
+`shadow` and `on` need `outbox=` and `ancestors=` (for types without parents: `lambda ref: ()`);
+`off` needs neither and never reads the outbox.
 
 | Mode | `check` / `filter` |
 |---|---|
-| `off` | Never calls the decision API. Allows everything (today's behaviour). |
-| `shadow` | Calls; each deny is logged as `shadow_deny` (logger `wolf_access_client`, level WARNING, with `user_id`, `client_id`, `action`, `resource_type`, `resource_id` as record attributes) and allowed. With wolf-access unreachable the call proceeds (logged `access_unavailable`). |
+| `off` | Never calls the decision API and never reads the outbox. Allows everything (today's behaviour). |
+| `shadow` | Calls; each deny is logged as `shadow_deny` (logger `wolf_access_client`, level WARNING, with `user_id`, `client_id`, `action`, `resource_type`, `resource_id` and `reason` as record attributes) and allowed. With no answer (wolf-access unreachable, the seed not verified) the call proceeds. |
 | `on` | Enforced. A deny, and every failure to get an answer, is a deny. |
+
+**No answer from stale data** (CUT-D1 (2)). In `shadow` and `on`, while a resource, or any
+resource in its parent chain, has an outbox row wolf-access has not applied (not sent yet, held,
+or dead-lettered), the gate does not ask wolf-access about it: `on` denies it and leaves it out of
+`filter`; `shadow` logs `shadow_deny` with `reason=outbox_unapplied` and allows it. The parent
+chain is read only while some row is unapplied.
+
+**Restart gate** (`on` only). After start-up, every check denies and every `filter` is empty
+until wolf-access has applied every row written before start-up and none is dead-lettered. Then
+the gate opens and stays open.
+
+**The seed gate.** Until the service's seed is verified, wolf-access refuses its decisions with
+409 (`SeedNotVerified`, logged as `seed_not_verified`): `on` denies, `shadow` blocks nothing.
+
+**A service with a gate of its own** (WolfNotes' and finOps' `access.py`) keeps its own mode
+handling and asks this gate which resources to withhold:
+
+```python
+refs = [ResourceRef("wolfnotes/note", n) for n in permitted_ids]
+held = gate.withheld(refs)          # stale, or everything during the restart gate (on)
+permitted_ids = [r.id for r in refs if r not in held]    # in shadow: log them instead
+```
+
+`withheld` is always empty in `off`, and holds every resource when the outbox cannot be read.
 
 - `AccessMode.parse(value)` accepts exactly `off`, `shadow` or `on`; anything else is a
   `ValueError`. `AccessGate` parses its mode the same way, so an unknown mode is refused when the
-  gate is built, and `shadow`/`on` need a client.
+  gate is built.
 - `AccessMode.from_env("wolfnotes")` reads `WOLFNOTES_ACCESS_MODE`. Unset or empty is `off`
   (the CUT-S1 default); any other value that is not an exact mode name is a `ValueError`, so a
   typo never silently means `off`.
@@ -268,6 +480,44 @@ WolfAccessError
   gets no answer, it keeps none.
 - A call with a missing `user_id` or `client_id` is logged as `invalid_request`: a deny in `on`,
   allowed in `shadow`, and nothing is sent.
+- Every logged field has its control characters escaped (`\x0a` for a line break), so no
+  request field can forge a log line; the record attributes keep the raw values.
+
+### 4. `/health`
+
+Both report in the body; the service's `/health` keeps answering HTTP 200:
+
+```python
+from wolf_access_client import RelayState
+
+async def health(request):
+    gate_health = gate.health                   # GateHealth: never raises
+    outbox = relay.state                        # RelayState: never raises
+    degraded = gate_health.status != "ok" or outbox is not RelayState.OK
+    return JSONResponse({"status": "degraded" if degraded else "ok",
+                         "access": gate_health.as_dict(), "outbox": outbox.value})
+```
+
+| `gate.health` | Meaning |
+|---|---|
+| `{"status": "ok"}` | the last decision call was answered |
+| `degraded`, `unavailable` | the last decision call got no answer (wolf-access unreachable or erroring) |
+| `degraded`, `seed_not_verified` | wolf-access answers no decision until the seed is verified |
+| `degraded`, `outbox_error` | the outbox store or the parent chain could not be read |
+| `degraded`, `restart_gate` | `on`, after a restart, waiting for the rows written before start-up |
+
+| `relay.state` | Meaning |
+|---|---|
+| `ok` | the state is reported and every row is applied |
+| `behind` | rows (or the state report) still to deliver, or held |
+| `refused` | a row is dead-lettered: an operator must fix its cause and call `retry_refused()` |
+| `unavailable` | wolf-access or the store could not be reached on the last attempt |
+
+### 5. Debugging and reconcile
+
+`client.changes_since(after)` iterates wolf-access's result for every row after `after`, oldest
+first (`GET …/changes`, a page of up to 1000 at a time); `client.changes_page(after)` is one page
+with `applied_through`. `store.unapplied_rows(n)` and `store.progress()` show the local side.
 
 ## Transport
 
@@ -287,6 +537,27 @@ WolfAccessError
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.
 
+## Changes from 0.2.0
+
+- **Breaking:** `AccessGate` in `shadow` and `on` needs `outbox=` (the service's
+  `OutboxStore`) and `ancestors=` (its parent chain), so it never answers from stale data
+  (CUT-D1 (2)). `off` is unchanged.
+- **Breaking (type):** `Written.zedtoken` is `str | None`. An empty token from wolf-access is now
+  `Written(None)` instead of a `WolfAccessResponseError`, and leaves `client.zedtoken` as it was
+  ([#26](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/26)).
+- New: `WolfAccessClient(..., service=)`, `report_state`, `send_changes`, `changes_page`,
+  `changes_since`; `Change`, `OutboxRow`, `ChangeResult`, `ChangesAnswer`, `OutboxProgress`;
+  `OutboxStore` with `PostgresOutboxStore` and `SQLiteOutboxStore`; `OutboxRelay` and
+  `RelayState`; `AccessGate.withheld`, `AccessGate.health` and `GateHealth`
+  ([#28](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/28)); `SeedNotVerified`;
+  `UseOutboxError`.
+- `IdempotencyKeyInUseError.retryable` is True
+  ([#25](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/25)).
+- Logged fields have control characters escaped
+  ([#29](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/29)); a problem name
+  that is not a plain `[a-z][a-z0-9_]{0,63}` is dropped
+  ([#30](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/30)).
+
 ## Changes from 0.1.0
 
 - **Breaking:** `evaluation` takes keyword-only `user_id=` and `client_id=` (was positional
@@ -297,17 +568,18 @@ WolfAccessError
 - New: `evaluations`, the three searches, the write API, typed problem errors, `AccessMode` and
   `AccessGate`. `Decision` gained `evaluated` and `.error`.
 
-## Not yet: wolf-access M1c
+## Seams: what arrives with wolf-access M1c-2 and M1c-3
 
-The CUT-D1 lifecycle outbox (`POST/GET /v1/services/{service}/changes`), intent checks
-(`POST /v1/resources/{type}/{id}/intent`), ownership requests and feed
-(`POST /v1/resources/{type}/{id}/ownership`, `GET /v1/services/{service}/ownership-changes`),
-the start-up state report and the reconcile snapshot (`PUT /v1/services/{service}/state`,
-`/snapshot`) arrive with wolf-access M1c. They will be methods on `WolfAccessClient` built on
-the same transport and error parsing (`WolfAccessClient._request` and `_problem` in
-`client.py`), and their problem names (`under_review`,
-`use_outbox`, `behind`) already arrive as a `ProblemError` with that `.name`.
-`AccessGate` is where the CUT-D1 (2) "no answer from stale data" and restart gates will plug in.
+These are not built yet; each has a named place to plug in, on the same transport and error
+parsing (`WolfAccessClient._request` and `_problem` in `client.py`).
+
+| Seam | Spec | Where it plugs in |
+|---|---|---|
+| **Intent tokens** (M1c-2): `POST /v1/resources/{type}/{id}/intent` before committing a move, `private` change or delete; the granted token goes in the outbox row | CUT-D1 (3) | a `WolfAccessClient.request_intent(...)` method; the token is already carried by `Change.move/set_private/delete(..., intent=token)` and sent as the row's `intent`. Until then wolf-access refuses such a row for a resource owned by an org, relationship or project. |
+| **Ownership requests** (M1c-3): `POST /v1/resources/{type}/{id}/ownership`, answered 409 `behind` until wolf-access has applied `after_sequence` | CUT-D1 (4) | a `WolfAccessClient` method taking `after_sequence` from `store.progress().last_sequence`; `behind` and `under_review` already arrive as a `ProblemError` with that `.name`. |
+| **Ownership feed and acknowledgements** (M1c-3): `GET /v1/services/{service}/ownership-changes?after=<cursor>`, applied in feed order with an `ack_ownership` outbox row in the same transaction | CUT-D1 (4) | the action `ack_ownership` is reserved (`Change` refuses it today) and the row's `entry` field is not sent yet; the feed poller will live beside `OutboxRelay`, and the cursor and pre-entry records beside the outbox tables. |
+| **Hints** on WolfNotes searches, dropped while any row is unapplied | CUT-D1 (2), WN-8 | `store.progress()` (`applied_through < last_sequence`) is the test; hints are not read yet ([#31](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/31)). |
+| **Reconcile snapshot**: `PUT /v1/services/{service}/snapshot` | CUT-D1 (5) | tagged with `store.progress().last_sequence`; `changes_since` shows what reconcile resolved. |
 
 ## Develop
 
@@ -317,7 +589,12 @@ python -m pytest -q
 ```
 
 Tests run against an in-process fake wolf-access server that records every request, so they
-check request shapes as well as answers. CI runs them on Python 3.10 and 3.12, scans the full git
-history for secrets (TruffleHog), and on every release tag installs that tag in a clean
-environment with no credentials. A release tag `vX.Y.Z` must match the `pyproject.toml` version
-`X.Y.Z`.
+check request shapes as well as answers; its cut-over intake follows wolf-access's own rules
+(rows applied in sequence, a gap held, a replay answered with its stored result, a refused row
+dead-lettered). The outbox store tests run on SQLite and on Postgres: set
+`TEST_DATABASE_URL` (an owner URL on a scratch server, e.g.
+`postgresql://postgres@127.0.0.1:5432/postgres`) to run the Postgres half, which is otherwise
+skipped. CI runs everything on Python 3.10 and 3.12 against a throwaway Postgres
+(`WAC_REQUIRE_POSTGRES=1` makes a skip a failure), scans the full git history for secrets
+(TruffleHog), and on every release tag installs that tag in a clean environment with no
+credentials. A release tag `vX.Y.Z` must match the `pyproject.toml` version `X.Y.Z`.
