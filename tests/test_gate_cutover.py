@@ -3,7 +3,8 @@
 - No answer from stale data: in `shadow` and `on`, while a resource, or any
   resource above it in the service's own parent chain, has an outbox row
   wolf-access has not applied, a check on it denies in `on` (logged as
-  `shadow_deny` in `shadow`) and the list-filter leaves it out.
+  `shadow_deny` in `shadow`), and in both modes the list-filter leaves it
+  out (criterion 181: "In `shadow` and `on`: ... a search leaves it out").
 - Restart gate: in `on`, after start-up, every check denies and every
   filter is empty until every row written before start-up is applied and
   none is dead-lettered.
@@ -180,21 +181,26 @@ def test_on_filter_of_only_stale_resources_sends_nothing(server, store, sqlite_b
     assert server.requests == []
 
 
-def test_shadow_filter_keeps_everything_and_logs_stale_and_denied(server, store,
-                                                                  sqlite_backend, caplog):
+def test_shadow_filter_leaves_stale_out_and_keeps_what_wolf_access_denies(
+        server, store, sqlite_backend, caplog):
+    """Criterion 181: in `shadow` too a search leaves a resource with an
+    unapplied row out (logged `shadow_deny`); a deny from wolf-access itself
+    is only logged, since shadow enforces no decision."""
     caplog.set_level(logging.INFO, LOGGER)
     gate = gate_for("shadow", server, store)
     append(sqlite_backend, move("n-1"))
     server.reply = Reply(body={"evaluations": [{"decision": False}, {"decision": True}]})
-    assert keep(gate, ["n-1", "n-2", "n-3"]) == ["n-1", "n-2", "n-3"]
+    assert keep(gate, ["n-1", "n-2", "n-3"]) == ["n-2", "n-3"]
     denies = [(r.resource_id, getattr(r, "reason", None))
               for r in events(caplog, "shadow_deny")]
     assert sorted(denies) == [("n-1", "outbox_unapplied"), ("n-2", "decision")]
+    assert [e["resource"]["id"] for e in server.requests[0].body["evaluations"]] == [
+        "n-2", "n-3"]
 
 
-def test_withheld_names_the_stale_resources(server, store, sqlite_backend):
-    """For a service with a gate of its own: which of these resources must not
-    be answered now (drop them from a search in `on`, log them in `shadow`)."""
+def test_withheld_names_the_stale_resources_in_shadow_and_on(server, store, sqlite_backend):
+    """For a service with a gate of its own: which of these resources to leave
+    out of a search or list now, in both `shadow` and `on` (criterion 181)."""
     for mode in ("shadow", "on"):
         gate = gate_for(mode, server, store)
         refs = [ResourceRef(NOTE, i) for i in ("n-1", "n-2", "n-3")]
@@ -227,11 +233,14 @@ def test_an_unreadable_outbox_is_no_answer(server, caplog):
 
         def unapplied(self, refs):
             raise OSError("database is down")
+    refs = [ResourceRef(NOTE, "n-1")]
     for mode, expected in (("on", False), ("shadow", True)):
         gate = AccessGate(mode, WolfAccessClient(server.url, CRED), outbox=Down(),
                           ancestors=ancestors)
         assert check(gate) is expected
         assert keep(gate, ["n-1"]) == (["n-1"] if expected else [])
+        # No answer: `on` withholds everything; in `shadow` the call proceeds.
+        assert gate.withheld(refs) == (set() if expected else set(refs))
         assert gate.health == GateHealth("degraded", "outbox_error")
     assert server.requests == []
     assert events(caplog, "outbox_error")

@@ -443,14 +443,16 @@ gate = AccessGate(mode, client, outbox=store, ancestors=parent_chain)
 | Mode | `check` / `filter` |
 |---|---|
 | `off` | Never calls the decision API and never reads the outbox. Allows everything (today's behaviour). |
-| `shadow` | Calls; each deny is logged as `shadow_deny` (logger `wolf_access_client`, level WARNING, with `user_id`, `client_id`, `action`, `resource_type`, `resource_id` and `reason` as record attributes) and allowed. With no answer (wolf-access unreachable, the seed not verified) the call proceeds. |
+| `shadow` | Calls; each deny is logged as `shadow_deny` (logger `wolf_access_client`, level WARNING, with `user_id`, `client_id`, `action`, `resource_type`, `resource_id` and `reason` as record attributes) and allowed. With no answer (wolf-access unreachable, the seed not verified) the call proceeds. Only stale data is left out of `filter` (below). |
 | `on` | Enforced. A deny, and every failure to get an answer, is a deny. |
 
 **No answer from stale data** (CUT-D1 (2)). In `shadow` and `on`, while a resource, or any
 resource in its parent chain, has an outbox row wolf-access has not applied (not sent yet, held,
-or dead-lettered), the gate does not ask wolf-access about it: `on` denies it and leaves it out of
-`filter`; `shadow` logs `shadow_deny` with `reason=outbox_unapplied` and allows it. The parent
-chain is read only while some row is unapplied.
+or dead-lettered), the gate does not ask wolf-access about it. A `check` on it denies in `on`,
+and in `shadow` is logged as `shadow_deny` with `reason=outbox_unapplied` and allowed. In **both**
+modes `filter` leaves it out (and `shadow` logs it): a search never shows a resource whose last
+change wolf-access has not applied (CUT-D1 (2), criterion 181). The parent chain is read only
+while some row is unapplied.
 
 **Restart gate** (`on` only). After start-up, every check denies and every `filter` is empty
 until wolf-access has applied every row written before start-up and none is dead-lettered. Then
@@ -464,11 +466,12 @@ handling and asks this gate which resources to withhold:
 
 ```python
 refs = [ResourceRef("wolfnotes/note", n) for n in permitted_ids]
-held = gate.withheld(refs)          # stale, or everything during the restart gate (on)
-permitted_ids = [r.id for r in refs if r not in held]    # in shadow: log them instead
+held = gate.withheld(refs)          # stale; in on also everything during the restart gate
+permitted_ids = [r.id for r in refs if r not in held]    # both modes; in shadow, log them too
 ```
 
-`withheld` is always empty in `off`, and holds every resource when the outbox cannot be read.
+`withheld` is always empty in `off`. When the outbox cannot be read it holds every resource in
+`on` and none in `shadow` (no answer: the call proceeds).
 
 - `AccessMode.parse(value)` accepts exactly `off`, `shadow` or `on`; anything else is a
   `ValueError`. `AccessGate` parses its mode the same way, so an unknown mode is refused when the
