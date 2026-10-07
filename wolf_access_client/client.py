@@ -541,8 +541,10 @@ class WolfAccessClient:
 
     def _write(self, method: str, path: str, body: dict[str, Any] | None,
                headers: dict[str, str] | None = None) -> Written | Pending:
-        """One `/v1` call: the seam the later write calls (outbox, intent,
-        ownership, state, snapshot) reuse."""
+        """One `/v1` write answered `{zedtoken}` (200/201) or `{status:
+        pending}` (202); an error status raises `_problem(...)`. The M1c calls
+        (outbox, intent, ownership, state, snapshot) answer other shapes: they
+        use `_request` and `_problem` with their own result parsing."""
         data = None if body is None else _encode(body)
         response = self._request(method, path, data, max_body=MAX_BODY,
                                  extra_headers=headers or {},

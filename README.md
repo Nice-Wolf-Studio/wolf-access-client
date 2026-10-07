@@ -304,8 +304,9 @@ The CUT-D1 lifecycle outbox (`POST/GET /v1/services/{service}/changes`), intent 
 (`POST /v1/resources/{type}/{id}/ownership`, `GET /v1/services/{service}/ownership-changes`),
 the start-up state report and the reconcile snapshot (`PUT /v1/services/{service}/state`,
 `/snapshot`) arrive with wolf-access M1c. They will be methods on `WolfAccessClient` built on
-the same write path (`_write`/`_request` in `client.py`), and their problem names
-(`under_review`, `use_outbox`, `behind`) arrive today as a `ProblemError` with that `.name`.
+the same transport and error parsing (`WolfAccessClient._request` and `_problem` in
+`client.py`), and their problem names (`under_review`,
+`use_outbox`, `behind`) already arrive as a `ProblemError` with that `.name`.
 `AccessGate` is where the CUT-D1 (2) "no answer from stale data" and restart gates will plug in.
 
 ## Develop
