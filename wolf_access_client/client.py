@@ -12,6 +12,11 @@ Service write API, `/v1` (API-D3): `register_type`, `create_resource`,
 `update_resource`, `delete_resource`. A write returns `Written(zedtoken)` or
 `Pending` (HTTP 202); a refusal raises a typed RFC 9457 `ProblemError`.
 
+Cut-over, `/v1/services/{service}` (CUT-D1, API-D10; the client's `service`):
+`report_state` (the start-up state report), `send_changes` (lifecycle
+outbox rows in), `changes_page` / `changes_since` (their results out). The
+outbox itself and its relay are `outbox.py` and `relay.py`.
+
 Consistency (CLI-D2): the client keeps no decision between calls. It keeps
 the ZedToken of the last write it made (or one passed to `remember_zedtoken`)
 and sends it as `context.zedtoken` (API-D4) on every decision, so a check
@@ -47,20 +52,29 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import Message
+from enum import Enum
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 from urllib.parse import quote, urlsplit
 
+from ._checks import PRINCIPAL_TYPES, service_name
+from ._checks import nonblank as _nonblank
+from ._checks import require as _require
+from ._checks import resource_type as _resource_type
 from .errors import (
     PROBLEM_TYPES,
     DecisionRefused,
     ProblemError,
+    SeedNotVerified,
     WolfAccessError,
     WolfAccessHTTPError,
     WolfAccessResponseError,
     WolfAccessUnavailable,
 )
 from .models import (
+    RESULTS,
+    ChangeResult,
+    ChangesAnswer,
     Decision,
     EvaluationItem,
     Parent,
@@ -78,6 +92,7 @@ SEARCH_ACTION_PATH = "/access/v1/search/action"
 SEARCH_SUBJECT_PATH = "/access/v1/search/subject"
 TYPES_PATH = "/v1/types"
 RESOURCES_PATH = "/v1/resources"
+SERVICES_PATH = "/v1/services"
 
 #: `options.evaluations_semantic` values (AuthZEN 1.0).
 SEMANTICS = ("execute_all", "deny_on_first_deny", "permit_on_first_permit")
@@ -85,8 +100,12 @@ SEMANTICS = ("execute_all", "deny_on_first_deny", "permit_on_first_permit")
 MAX_EVALUATIONS = 1000
 #: AuthZEN `page.limit` bounds on wolf-access (API-D5: default 100, max 1000).
 PAGE_MAX = 1000
-#: Principal kinds an owner may be (API-D3).
-PRINCIPAL_TYPES = ("user", "org", "relationship", "project", "agent")
+#: Enforcement modes a service reports (CUT-S1).
+MODES = ("off", "shadow", "on")
+#: wolf-access takes 1 to this many outbox rows per `POST …/changes` (API-D10).
+MAX_CHANGE_ROWS = 500
+#: `GET …/changes` answers at most this many rows per call (API-D10).
+CHANGES_PAGE_MAX = 1000
 #: `context` keys that are parameters of their own, never passed in `context`.
 RESERVED_CONTEXT = ("client_id", "user_id", "zedtoken")
 
@@ -104,19 +123,11 @@ _BEARER = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 _IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
 _PRIVATE_SUFFIX = ".railway.internal"
 _PROBLEM_PREFIX = "urn:wolfaccess:problem:"
+# A problem name kept from the server: short and plain, never text (#30).
+_PROBLEM_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _UNSET: Any = object()
 
 T = TypeVar("T")
-
-
-def _nonblank(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
-
-
-def _require(**values: Any) -> None:
-    for name, value in values.items():
-        if not _nonblank(value):
-            raise ValueError(f"{name} must be a non-empty string")
 
 
 def _private_host(host: str) -> bool:
@@ -193,11 +204,11 @@ def _json_object(raw: bytes) -> dict[str, Any]:
     return data
 
 
-def _encode(body: Mapping[str, Any]) -> bytes:
+def _encode(body: Mapping[str, Any], what: str = "context") -> bytes:
     try:
         return json.dumps(body, allow_nan=False).encode("utf-8")
     except (TypeError, ValueError, RecursionError):
-        raise ValueError("context must be JSON-serializable") from None
+        raise ValueError(f"{what} must be JSON-serializable") from None
 
 
 def _retry_after(headers: Message) -> float | None:
@@ -214,17 +225,6 @@ def _retry_after(headers: Message) -> float | None:
     if when is None or when.tzinfo is None:
         return None
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
-
-
-def _resource_type(resource_type: Any) -> tuple[str, str]:
-    """`<service>/<type>`: exactly one `/`, two non-empty parts, no whitespace."""
-    if not isinstance(resource_type, str):
-        raise ValueError("resource_type must be '<service>/<type>'")
-    service, sep, name = resource_type.partition("/")
-    if not sep or not service or not name or "/" in name or any(
-            c.isspace() or ord(c) < 32 for c in resource_type):
-        raise ValueError("resource_type must be '<service>/<type>'")
-    return service, name
 
 
 def _strings(value: Any, name: str, *, allow_empty: bool) -> list[str]:
@@ -248,9 +248,14 @@ class _Response:
 
 
 class WolfAccessClient:
+    """`service` is the service this credential belongs to (`wolfnotes`,
+    `finops`): needed only for the cut-over calls, which go to
+    `/v1/services/{service}`."""
+
     def __init__(self, base_url: str, service_credential: str, *,
-                 timeout: float = DEFAULT_TIMEOUT) -> None:
+                 timeout: float = DEFAULT_TIMEOUT, service: str | None = None) -> None:
         self._target = _target(base_url)
+        self._service = None if service is None else service_name(service)
         if not isinstance(service_credential, str) or not _BEARER.fullmatch(
                 service_credential):
             raise ValueError("service_credential must be a bearer token (RFC 6750 "
@@ -262,6 +267,11 @@ class WolfAccessClient:
 
     def __repr__(self) -> str:
         return f"WolfAccessClient({self._target.display!r})"
+
+    @property
+    def service(self) -> str | None:
+        """The service the cut-over calls are made for, or None."""
+        return self._service
 
     # --- ZedToken (CLI-D2) -----------------------------------------------------------
 
@@ -418,7 +428,9 @@ class WolfAccessClient:
     def _decide(self, path: str, data: bytes, max_body: int) -> dict[str, Any]:
         response = self._request("POST", path, data, max_body=max_body)
         if response.status != 200:
-            raise DecisionRefused(response.status, retry_after=_retry_after(response.headers))
+            # 409 is wolf-access's seed gate, its only 409 on /access/v1 (API-D10 (d)).
+            cls = SeedNotVerified if response.status == 409 else DecisionRefused
+            raise cls(response.status, retry_after=_retry_after(response.headers))
         return _json_object(response.body)
 
     def _search(self, path: str, body: dict[str, Any], page_size: Any,
@@ -551,10 +563,102 @@ class WolfAccessClient:
                                  accept="application/json, application/problem+json")
         if 200 <= response.status < 300:
             result = _write_result(response.status, response.body)
-            if isinstance(result, Written):
+            if isinstance(result, Written) and result.zedtoken:
                 self._zedtoken = result.zedtoken
             return result
         raise _problem(response)
+
+    # --- cut-over: /v1/services/{service} (CUT-D1, API-D10) ----------------------------
+
+    def _service_path(self, leaf: str) -> str:
+        if self._service is None:
+            raise ValueError("the cut-over calls need WolfAccessClient(..., service=<name>)")
+        return f"{SERVICES_PATH}/{quote(self._service, safe='')}/{leaf}"
+
+    def report_state(self, mode: Any, registration_start: datetime) -> None:
+        """The start-up state report (CUT-D1, CUT-S1): the service's
+        enforcement mode (`off`, `shadow`, `on` or an `AccessMode`) and its
+        registration start (a time-zone-aware `datetime`, sent as RFC 3339).
+        Made at every start-up, in every mode (`OutboxRelay` makes it). From
+        the first report on, the service's direct resource writes are refused
+        (`UseOutboxError`) and its decisions wait for a verified seed."""
+        path = self._service_path("state")
+        value = mode.value if isinstance(mode, Enum) else mode
+        if not isinstance(value, str) or value not in MODES:
+            raise ValueError("mode must be one of " + ", ".join(MODES))
+        if not isinstance(registration_start, datetime) or \
+                registration_start.utcoffset() is None:
+            raise ValueError("registration_start must be a datetime with a time zone")
+        body = {"mode": value, "registration_start": registration_start.isoformat()}
+        response = self._request("PUT", path, _encode(body), max_body=MAX_BODY,
+                                 accept="application/json, application/problem+json")
+        if not 200 <= response.status < 300:
+            raise _problem(response)
+        if response.status != 200:
+            raise WolfAccessResponseError(f"HTTP {response.status} is not a state answer")
+        _json_object(response.body)
+
+    def send_changes(self, rows: Sequence[Mapping[str, Any]]) -> ChangesAnswer:
+        """Send 1 to 500 outbox rows, in sequence order, as wolf-access takes
+        them (`OutboxRow.wire()`; API-D10 (a)). Returns one `ChangeResult` per
+        row, in order, and `applied_through`. A row already applied is answered
+        with its stored result and changes nothing, so sending a row again is
+        always safe. `OutboxRelay` is the usual caller."""
+        path = self._service_path("changes")
+        if not isinstance(rows, (list, tuple)) or not 1 <= len(rows) <= MAX_CHANGE_ROWS:
+            raise ValueError(f"rows must be a list of 1 to {MAX_CHANGE_ROWS} rows")
+        sent = []
+        for row in rows:
+            if not isinstance(row, Mapping) or not _sequence_number(row.get("sequence")) \
+                    or not _nonblank(row.get("change_id")) or not _nonblank(row.get("action")):
+                raise ValueError("each row has a positive integer sequence, a change_id and "
+                                 "an action")
+            sent.append(dict(row))
+        response = self._request("POST", path, _encode({"rows": sent}, "rows"),
+                                 max_body=MAX_BODY,
+                                 accept="application/json, application/problem+json")
+        if not 200 <= response.status < 300:
+            raise _problem(response)
+        answer = _changes_answer(response.status, response.body)
+        if [r.sequence for r in answer.results] != [r["sequence"] for r in sent]:
+            raise WolfAccessResponseError("the results do not match the rows sent")
+        return answer
+
+    def changes_page(self, after: int = 0) -> ChangesAnswer:
+        """One `GET /v1/services/{service}/changes?after=<after>`: the stored
+        rows after `after`, oldest first, at most 1000, with
+        `applied_through` (API-D10 (b))."""
+        path = self._service_path("changes")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after must be a sequence number (an integer >= 0)")
+        response = self._request("GET", f"{path}?after={after}", None,
+                                 max_body=MAX_SEARCH_BODY,
+                                 accept="application/json, application/problem+json")
+        if not 200 <= response.status < 300:
+            raise _problem(response)
+        answer = _changes_answer(response.status, response.body)
+        seqs = [r.sequence for r in answer.results]
+        if len(seqs) > CHANGES_PAGE_MAX or any(s <= after for s in seqs) or any(
+                a >= b for a, b in zip(seqs, seqs[1:])):
+            raise WolfAccessResponseError("the rows are not after the cursor, in order")
+        return answer
+
+    def changes_since(self, after: int = 0) -> Iterator[ChangeResult]:
+        """Every stored row's result after `after`, oldest first, a page at a
+        time as the iterator is consumed (for reconcile and debugging). A
+        failure on any page raises from the iterator."""
+        self._service_path("changes")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise ValueError("after must be a sequence number (an integer >= 0)")
+        return self._changes_pages(after)
+
+    def _changes_pages(self, after: int) -> Iterator[ChangeResult]:
+        while True:
+            page = self.changes_page(after)
+            yield from page.results
+            if len(page.results) < CHANGES_PAGE_MAX:
+                return
+            after = page.results[-1].sequence
 
     # --- transport -------------------------------------------------------------------
 
@@ -665,9 +769,10 @@ def _write_result(status: int, raw: bytes) -> Written | Pending:
     data = _json_object(raw)
     if status in (200, 201):
         token = data.get("zedtoken")
-        if not _nonblank(token):
+        if not isinstance(token, str):
             raise WolfAccessResponseError("a write answer has no 'zedtoken'")
-        return Written(token)
+        # An empty token: wolf-access holds no watermark yet (#26); the write happened.
+        return Written(token if token.strip() else None)
     if status == 202 and data.get("status") == "pending":
         return Pending()
     raise WolfAccessResponseError(f"HTTP {status} is not a write answer")
@@ -690,8 +795,36 @@ def _problem(response: _Response) -> WolfAccessHTTPError:
         return value if isinstance(value, str) else None   # RFC 9457 section 3.1
     type_ = text("type")
     name = type_[len(_PROBLEM_PREFIX):] if type_ and type_.startswith(_PROBLEM_PREFIX) \
-        and len(type_) > len(_PROBLEM_PREFIX) else None
+        else None
+    if name is not None and not _PROBLEM_NAME.fullmatch(name):
+        name = None
     cls = PROBLEM_TYPES.get(name, ProblemError) if name else ProblemError
     return cls(response.status, name=name, type=type_, title=text("title"),
                detail=text("detail"), retry_after=retry_after,
                www_authenticate=response.headers.get("WWW-Authenticate"))
+
+
+def _sequence_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
+def _changes_answer(status: int, raw: bytes) -> ChangesAnswer:
+    """`{"results": [{sequence, status, reason?}], "applied_through": n}`."""
+    if status != 200:
+        raise WolfAccessResponseError(f"HTTP {status} is not a changes answer")
+    data = _json_object(raw)
+    results, through = data.get("results"), data.get("applied_through")
+    if not isinstance(results, list) or isinstance(through, bool) \
+            or not isinstance(through, int) or through < 0:
+        raise WolfAccessResponseError("a changes answer has no 'results' list or "
+                                      "'applied_through'")
+    out = []
+    for item in results:
+        if not isinstance(item, dict) or not _sequence_number(item.get("sequence")) \
+                or item.get("status") not in RESULTS:
+            raise WolfAccessResponseError("a result is not {sequence, status}")
+        reason = item.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise WolfAccessResponseError("a result's 'reason' is not text")
+        out.append(ChangeResult(item["sequence"], item["status"], reason or None))
+    return ChangesAnswer(tuple(out), through)

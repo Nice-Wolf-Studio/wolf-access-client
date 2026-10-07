@@ -1,6 +1,9 @@
 # Copied from gateway-client's ci.yml (pytest on Python 3.10 and 3.12), plus
 # a full-history secret scan and, on a release tag, a credential-free install
-# of that tag (wolf-access spec BND-12 / CLI-D1).
+# of that tag (wolf-access spec BND-12 / CLI-D1). The pytest job runs a
+# throwaway Postgres for the Postgres outbox store's tests; WAC_REQUIRE_POSTGRES
+# turns their local skip into a failure, so CI never goes green without them.
+# The container trusts local connections, so no password appears anywhere.
 name: ci
 on:
   push:
@@ -15,6 +18,21 @@ jobs:
     strategy:
       matrix:
         python: ["3.10", "3.12"]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+      WAC_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@v4
         with:

@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wolf-access-client"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python client library for wolf-access, the Nice-Wolf-Studio authorization service."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+# psycopg2-binary runs the Postgres reference store's tests (TEST_DATABASE_URL);
+# the library itself needs no driver.
+test = ["pytest>=8", "psycopg2-binary==2.9.13"]
 
 [project.urls]
 Source = "https://github.com/Nice-Wolf-Studio/wolf-access-client"

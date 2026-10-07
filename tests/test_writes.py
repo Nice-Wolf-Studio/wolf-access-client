@@ -306,7 +306,7 @@ def test_a_write_s_zedtoken_is_sent_with_the_next_decision(server):
 
 @pytest.mark.parametrize("reply", [
     Reply(status=200, body={}),
-    Reply(status=200, body={"zedtoken": ""}),
+    Reply(status=200, body={"zedtoken": None}),
     Reply(status=201, body={"zedtoken": 5}),
     Reply(status=200, body=[]),
     Reply(status=200, raw=b"not json"),
@@ -320,6 +320,26 @@ def test_malformed_write_answer_is_a_response_error(server, reply):
     client = WolfAccessClient(server.url, CRED)
     with pytest.raises(WolfAccessResponseError):
         create(client)
+    assert client.zedtoken is None
+
+
+@pytest.mark.parametrize("status", [200, 201])
+def test_an_empty_zedtoken_is_written_with_no_token(server, status):
+    """wolf-access answers `{"zedtoken": ""}` when it has no watermark yet
+    (#26, wolf-access#165): the write happened; there is no token to carry,
+    and the token the client already holds stays."""
+    server.reply = Reply(status=status, body={"zedtoken": ""})
+    client = WolfAccessClient(server.url, CRED)
+    client.remember_zedtoken("zt-before")
+    result = create(client)
+    assert result == Written(None) and result.zedtoken is None
+    assert client.zedtoken == "zt-before"
+
+
+def test_an_empty_zedtoken_with_nothing_remembered_leaves_none(server):
+    server.reply = Reply(status=200, body={"zedtoken": ""})
+    client = WolfAccessClient(server.url, CRED)
+    assert client.register_type("wolfnotes/note", permissions=[]) == Written(None)
     assert client.zedtoken is None
 
 

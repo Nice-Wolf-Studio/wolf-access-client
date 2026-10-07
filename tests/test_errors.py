@@ -23,6 +23,7 @@ from wolf_access_client import (
     RateLimitedError,
     UnauthorizedError,
     UnavailableError,
+    UseOutboxError,
     WolfAccessClient,
     WolfAccessError,
     WolfAccessHTTPError,
@@ -42,7 +43,8 @@ NAMES = [
     ("rate_limited", 429, RateLimitedError, True),
     ("unavailable", 503, UnavailableError, True),
     ("idempotency_key_reused", 422, IdempotencyKeyReusedError, False),
-    ("idempotency_key_in_use", 409, IdempotencyKeyInUseError, False),
+    ("idempotency_key_in_use", 409, IdempotencyKeyInUseError, True),
+    ("use_outbox", 409, UseOutboxError, False),
 ]
 
 
@@ -71,7 +73,7 @@ def test_each_problem_name_is_its_own_exception(server, name, status, cls, retry
     assert err.retryable is retryable
 
 
-def test_problem_names_cover_the_m1b_api():
+def test_problem_names_cover_the_m1b_and_m1c1_api():
     assert sorted(PROBLEM_TYPES) == sorted(n for n, *_ in NAMES)
 
 
@@ -110,6 +112,41 @@ def test_retry_after_http_date_in_the_future(server):
     with pytest.raises(UnavailableError) as exc:
         create(WolfAccessClient(server.url, CRED))
     assert 80 <= exc.value.retry_after <= 91
+
+
+def test_idempotency_key_in_use_is_retried_to_the_first_answer(server):
+    """#25: 409 `idempotency_key_in_use` is answered only while the first
+    request with that key runs; a retry gated on `.retryable` gets its answer."""
+    server.queue("POST", "/v1/resources", problem("idempotency_key_in_use", 409),
+                 Reply(status=201, body={"zedtoken": "zt-1"}))
+    client = WolfAccessClient(server.url, CRED)
+    try:
+        create(client)
+    except WolfAccessError as exc:
+        assert exc.retryable
+        result = create(client)
+    assert result.zedtoken == "zt-1"
+
+
+@pytest.mark.parametrize("name", ["x\ny", "a" * 10240, "Under_Review", "under-review",
+                                  "_x", "a" * 65, "x y", "é"])
+def test_a_problem_name_that_is_not_a_plain_name_is_dropped(server, name):
+    """#30: the server's problem type never controls `str(exc)` beyond a short
+    plain name `[a-z][a-z0-9_]{0,63}`."""
+    server.reply = Reply(status=400, content_type="application/problem+json",
+                         body={"type": PROBLEM + name, "status": 400})
+    with pytest.raises(ProblemError) as exc:
+        create(WolfAccessClient(server.url, CRED))
+    assert type(exc.value) is ProblemError and exc.value.name is None
+    assert str(exc.value) == "wolf-access answered HTTP 400"
+
+
+def test_a_64_character_name_is_kept(server):
+    name = "a" * 64
+    server.reply = problem(name, 409)
+    with pytest.raises(ProblemError) as exc:
+        create(WolfAccessClient(server.url, CRED))
+    assert exc.value.name == name
 
 
 def test_unknown_problem_name_is_a_problem_error_with_its_name(server):
