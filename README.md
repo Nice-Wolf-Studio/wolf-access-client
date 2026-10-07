@@ -72,9 +72,14 @@ def can_view(caller, note_id) -> bool:
 - **Transport.** `https://` for any host; plain `http://` is refused except for private hosts
   (loopback, `localhost`, `*.railway.internal`). Certificates are always verified, environment
   proxies are ignored and redirects are not followed, so the credential only goes to
-  `base_url`'s host. `timeout` (default 5 s, at most 3600 s) limits each network operation
-  (each connect attempt, the send, each read) and the body read as a whole. The call runs on
-  the caller's thread and starts no threads. Name lookup uses the system resolver's own limits.
+  `base_url`'s host. The call runs on the caller's thread and starts no threads.
+- **Timeout.** `timeout` (default 5 s, at most 3600 s) is a per-operation limit: each connect
+  attempt, the send and each socket read wait at most `timeout`, and between reads of the
+  response body the call stops once `timeout` has passed since it began. It does **not** bound
+  the whole call: several connect attempts, slowly sent headers or slow chunked framing can make
+  one call take several times `timeout`
+  ([#2](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/2)). Such a call still
+  ends in `WolfAccessUnavailable`, i.e. deny. Name lookup uses the system resolver's own limits.
 - The credential must be an RFC 6750 bearer token (no spaces, line breaks or control
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.

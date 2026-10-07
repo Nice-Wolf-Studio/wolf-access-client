@@ -21,10 +21,16 @@ Transport rules: `https://` for any host, `http://` only for private hosts
 (loopback, `localhost`, `*.railway.internal`; spec API-D1). It speaks HTTP
 with `http.client` directly: no environment proxies, no redirects, and
 certificates are always verified with the client's own SSL context, so the
-credential only ever goes to `base_url`'s host. `timeout` limits each network
-operation (each connect attempt, the send, each read) and the body read as a
-whole; the call runs on the caller's thread and starts no threads. Name lookup
-uses the system resolver's own limits.
+credential only ever goes to `base_url`'s host.
+
+`timeout` is a per-operation limit: each connect attempt, the send and each
+socket read wait at most `timeout`. Between reads of the response body the
+call also stops once `timeout` has passed since it began. It does NOT bound
+the whole call: several connect attempts, slowly sent headers or slow chunked
+framing can make one call take several times `timeout` (issue #2). Every such
+call still ends in `WolfAccessUnavailable` (deny). Name lookup uses the system
+resolver's own limits. The call runs on the caller's thread and starts no
+threads.
 
 Standard library only.
 """
