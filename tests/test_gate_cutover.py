@@ -1,10 +1,10 @@
 """`AccessGate` at cut-over (CUT-D1 (2), the seed gate, #28):
 
-- No answer from stale data: in `shadow` and `on`, while a resource, or any
-  resource above it in the service's own parent chain, has an outbox row
-  wolf-access has not applied, a check on it denies in `on` (logged as
-  `shadow_deny` in `shadow`), and in both modes the list-filter leaves it
-  out (criterion 181: "In `shadow` and `on`: ... a search leaves it out").
+- No answer from stale data: while a resource, or any resource above it in
+  the service's own parent chain, has an outbox row wolf-access has not
+  applied, `on` denies a check on it and leaves it out of the list-filter.
+  `shadow` never changes an answer: it answers exactly like `off` and logs
+  what `on` would do (`shadow_deny`, `reason=stale`).
 - Restart gate: in `on`, after start-up, every check denies and every
   filter is empty until every row written before start-up is applied and
   none is dead-lettered.
@@ -160,7 +160,7 @@ def test_shadow_logs_a_stale_resource_as_shadow_deny_and_allows(server, store,
     append(sqlite_backend, move("n-1"))
     assert check(gate, "n-1") is True
     (record,) = events(caplog, "shadow_deny")
-    assert (record.resource_id, record.reason) == ("n-1", "outbox_unapplied")
+    assert (record.resource_id, record.reason) == ("n-1", "stale")
     assert server.requests == []
 
 
@@ -181,33 +181,74 @@ def test_on_filter_of_only_stale_resources_sends_nothing(server, store, sqlite_b
     assert server.requests == []
 
 
-def test_shadow_filter_leaves_stale_out_and_keeps_what_wolf_access_denies(
-        server, store, sqlite_backend, caplog):
-    """Criterion 181: in `shadow` too a search leaves a resource with an
-    unapplied row out (logged `shadow_deny`); a deny from wolf-access itself
-    is only logged, since shadow enforces no decision."""
+def test_shadow_filter_keeps_everything_and_logs_stale_and_denied(server, store,
+                                                                  sqlite_backend, caplog):
+    """`shadow` never changes an answer: a stale resource is kept and logged
+    `shadow_deny reason=stale` (not asked about, as `on` would not ask), and
+    a deny from wolf-access is kept and logged `reason=decision`."""
     caplog.set_level(logging.INFO, LOGGER)
     gate = gate_for("shadow", server, store)
     append(sqlite_backend, move("n-1"))
     server.reply = Reply(body={"evaluations": [{"decision": False}, {"decision": True}]})
-    assert keep(gate, ["n-1", "n-2", "n-3"]) == ["n-2", "n-3"]
+    assert keep(gate, ["n-1", "n-2", "n-3"]) == ["n-1", "n-2", "n-3"]
     denies = [(r.resource_id, getattr(r, "reason", None))
               for r in events(caplog, "shadow_deny")]
-    assert sorted(denies) == [("n-1", "outbox_unapplied"), ("n-2", "decision")]
+    assert sorted(denies) == [("n-1", "stale"), ("n-2", "decision")]
     assert [e["resource"]["id"] for e in server.requests[0].body["evaluations"]] == [
         "n-2", "n-3"]
 
 
-def test_withheld_names_the_stale_resources_in_shadow_and_on(server, store, sqlite_backend):
-    """For a service with a gate of its own: which of these resources to leave
-    out of a search or list now, in both `shadow` and `on` (criterion 181)."""
-    for mode in ("shadow", "on"):
-        gate = gate_for(mode, server, store)
-        refs = [ResourceRef(NOTE, i) for i in ("n-1", "n-2", "n-3")]
-        assert gate.withheld(refs) == set()
-        append(sqlite_backend, create_folder("f-1"))
-        assert gate.withheld(refs) == {refs[0], refs[1]}
-        applied_through(store, store.progress().last_sequence)
+def test_shadow_filter_answers_exactly_like_off(server, store, sqlite_backend):
+    append(sqlite_backend, create_folder("f-1"))
+    server.reply = Reply(body={"evaluations": [{"decision": False}]})
+    ids = ["n-1", "n-2", "n-3"]
+    assert keep(gate_for("shadow", server, store), ids) == keep(AccessGate("off"), ids) == ids
+
+
+def test_withheld_in_on_names_the_stale_resources(server, store, sqlite_backend):
+    """For a service with a gate of its own: which resources `on` leaves out
+    of a search or list now."""
+    gate = gate_for("on", server, store)
+    refs = [ResourceRef(NOTE, i) for i in ("n-1", "n-2", "n-3")]
+    assert gate.withheld(refs) == set()
+    append(sqlite_backend, create_folder("f-1"))
+    assert gate.withheld(refs) == {refs[0], refs[1]}
+
+
+def test_withheld_in_shadow_withholds_nothing_and_logs_what_on_would(server, store,
+                                                                     sqlite_backend, caplog):
+    caplog.set_level(logging.INFO, LOGGER)
+    gate = gate_for("shadow", server, store)
+    refs = [ResourceRef(NOTE, i) for i in ("n-1", "n-2", "n-3")]
+    append(sqlite_backend, create_folder("f-1"))
+    assert gate.withheld(refs, user_id="user-1", client_id="client-1", action="view") == set()
+    records = events(caplog, "shadow_deny")
+    assert sorted((r.resource_id, r.reason) for r in records) == [("n-1", "stale"),
+                                                                 ("n-2", "stale")]
+    assert {(r.user_id, r.client_id, r.action, r.resource_type) for r in records} == {
+        ("user-1", "client-1", "view", NOTE)}
+    caplog.clear()
+    assert gate.withheld(refs) == set()               # the caller fields are optional
+    assert [r.user_id for r in events(caplog, "shadow_deny")] == [None, None]
+
+
+def test_shadow_never_returns_hints(server, store, sqlite_backend):
+    """CUT-D1 (2) as corrected (wolf-access f1ff093): `shadow` answers exactly
+    like `off`, which makes no decision call and so has no wolf-access hints.
+    The library returns no hint in any mode (#31): a search page carrying
+    `context.hints` yields resource references only."""
+    server.reply = Reply(body={
+        "results": [{"type": NOTE, "id": "n-1"}], "page": {"next_token": "", "count": 1},
+        "context": {"hints": [{"person": "user-2", "topic": "t-1", "hint": "h-1"}]}})
+    append(sqlite_backend, move("n-1"))                 # n-1 is stale: shadow keeps it
+    gate = gate_for("shadow", server, store)
+    client = WolfAccessClient(server.url, CRED, service="wolfnotes")
+    found = list(client.search_resources(user_id="user-1", client_id="client-1",
+                                         action="view", resource_type=NOTE))
+    assert found == [ResourceRef(NOTE, "n-1")]
+    assert all(type(ref) is ResourceRef for ref in found)
+    assert gate.withheld(found, user_id="user-1", client_id="client-1", action="view") == set()
+    assert "h-1" not in repr(found)
 
 
 def test_the_parent_chain_is_not_read_while_nothing_is_unapplied(server, store):

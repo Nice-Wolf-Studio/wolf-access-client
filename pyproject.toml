@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wolf-access-client"
-version = "0.3.0"
+version = "0.3.1"
 description = "Python client library for wolf-access, the Nice-Wolf-Studio authorization service."
 readme = "README.md"
 requires-python = ">=3.10"

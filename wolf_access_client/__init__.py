@@ -45,7 +45,7 @@ from .models import (
 from .outbox import OutboxStore, PostgresOutboxStore, SQLiteOutboxStore
 from .relay import OutboxRelay, RelayState
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     # client and values

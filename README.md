@@ -14,7 +14,7 @@ Install it by release tag, the same way as
 is needed:
 
 ```bash
-pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.3.0"
+pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.3.1"
 ```
 
 Python 3.10+, standard library only. The Postgres outbox store works over the DB-API driver
@@ -397,8 +397,9 @@ relay.stop(timeout=10)                                      # at shutdown
 
 In an asyncio service, run it on a worker thread instead: `task =
 asyncio.create_task(asyncio.to_thread(relay.run_forever))`, and `relay.stop()` at shutdown.
-Run **one** relay per service process that writes the outbox; a second one is harmless (every
-row is idempotent) but wasteful.
+Run **exactly one** relay per service. Every row is idempotent on wolf-access's side, but two
+relays recording into one store can record answers out of order and hide a dead letter
+([#39](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/39)).
 
 What it does, step by step:
 
@@ -418,7 +419,8 @@ What it does, step by step:
    then call `relay.retry_refused()` (one more delivery). Meanwhile the relay polls `GET
    …/changes` every `refused_interval` (60 s), so a row reconcile resolves is picked up.
 5. **Failures**: on 408, 429, 5xx, a network error or a malformed answer it backs off
-   exponentially with jitter (1 s up to 300 s) and never retries before a `Retry-After`. Any
+   exponentially with jitter (1 s up to 300 s) and never retries before a `Retry-After`
+   (a `Retry-After` longer than one hour is capped at one hour, `MAX_RETRY_AFTER`). Any
    other refusal (a wrong credential or service name) waits 300 s and is logged as an error;
    the rows are kept, so fixing the configuration needs no restart.
 
@@ -443,16 +445,14 @@ gate = AccessGate(mode, client, outbox=store, ancestors=parent_chain)
 | Mode | `check` / `filter` |
 |---|---|
 | `off` | Never calls the decision API and never reads the outbox. Allows everything (today's behaviour). |
-| `shadow` | Calls; each deny is logged as `shadow_deny` (logger `wolf_access_client`, level WARNING, with `user_id`, `client_id`, `action`, `resource_type`, `resource_id` and `reason` as record attributes) and allowed. With no answer (wolf-access unreachable, the seed not verified) the call proceeds. Only stale data is left out of `filter` (below). |
+| `shadow` | **Never changes an answer**: answers exactly like `off`, and logs what `on` would do. Each check or filter entry `on` would deny is logged as `shadow_deny` (logger `wolf_access_client`, level WARNING, with `user_id`, `client_id`, `action`, `resource_type`, `resource_id` and `reason` as record attributes: `decision` for a deny from wolf-access, `stale` for stale data, below). With no answer (wolf-access unreachable, the seed not verified) the call proceeds. |
 | `on` | Enforced. A deny, and every failure to get an answer, is a deny. |
 
-**No answer from stale data** (CUT-D1 (2)). In `shadow` and `on`, while a resource, or any
-resource in its parent chain, has an outbox row wolf-access has not applied (not sent yet, held,
-or dead-lettered), the gate does not ask wolf-access about it. A `check` on it denies in `on`,
-and in `shadow` is logged as `shadow_deny` with `reason=outbox_unapplied` and allowed. In **both**
-modes `filter` leaves it out (and `shadow` logs it): a search never shows a resource whose last
-change wolf-access has not applied (CUT-D1 (2), criterion 181). The parent chain is read only
-while some row is unapplied.
+**No answer from stale data** (CUT-D1 (2)). While a resource, or any resource in its parent
+chain, has an outbox row wolf-access has not applied (not sent yet, held, or dead-lettered), the
+gate does not ask wolf-access about it. In `on`, a `check` on it denies and `filter` leaves it
+out. In `shadow` the answer is unchanged (allowed, kept) and it is logged as `shadow_deny` with
+`reason=stale`. The parent chain is read only while some row is unapplied.
 
 **Restart gate** (`on` only). After start-up, every check denies and every `filter` is empty
 until wolf-access has applied every row written before start-up and none is dead-lettered. Then
@@ -466,12 +466,15 @@ handling and asks this gate which resources to withhold:
 
 ```python
 refs = [ResourceRef("wolfnotes/note", n) for n in permitted_ids]
-held = gate.withheld(refs)          # stale; in on also everything during the restart gate
-permitted_ids = [r.id for r in refs if r not in held]    # both modes; in shadow, log them too
+held = gate.withheld(refs, user_id=caller.user_id, client_id=caller.client_id, action="view")
+permitted_ids = [r.id for r in refs if r not in held]
 ```
 
-`withheld` is always empty in `off`. When the outbox cannot be read it holds every resource in
-`on` and none in `shadow` (no answer: the call proceeds).
+In `on`, `withheld` holds the stale resources, every resource during the restart gate, and every
+resource when the outbox cannot be read. In `shadow` it is always empty (shadow never changes an
+answer) and logs `shadow_deny reason=stale` for each resource `on` would hold for stale data; the
+`user_id`, `client_id` and `action` keywords only fill in that log record. In `off` it is always
+empty and the outbox is not read.
 
 - `AccessMode.parse(value)` accepts exactly `off`, `shadow` or `on`; anything else is a
   `ValueError`. `AccessGate` parses its mode the same way, so an unknown mode is refused when the
@@ -540,6 +543,20 @@ with `applied_through`. `store.unapplied_rows(n)` and `store.progress()` show th
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.
 
+## Changes from 0.3.0
+
+- **`shadow` never changes an answer.** 0.3.0 left stale resources out of `filter` and
+  `withheld` in `shadow`; now `shadow` keeps them (it answers exactly like `off`) and logs a
+  `shadow_deny` for each with `reason=stale`. Only `on` leaves them out. The stale reason is
+  `stale` everywhere (it was `outbox_unapplied`).
+- `withheld(resources, *, user_id=None, client_id=None, action=None)`: the keywords fill in the
+  `shadow_deny` record.
+- A `Retry-After` longer than one hour is waited one hour (`MAX_RETRY_AFTER`); a huge one no
+  longer kills the relay thread
+  ([#33](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/33)).
+- README: run exactly one relay per service
+  ([#39](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/39)).
+
 ## Changes from 0.2.0
 
 - **Breaking:** `AccessGate` in `shadow` and `on` needs `outbox=` (the service's
@@ -581,7 +598,7 @@ parsing (`WolfAccessClient._request` and `_problem` in `client.py`).
 | **Intent tokens** (M1c-2): `POST /v1/resources/{type}/{id}/intent` before committing a move, `private` change or delete; the granted token goes in the outbox row | CUT-D1 (3) | a `WolfAccessClient.request_intent(...)` method; the token is already carried by `Change.move/set_private/delete(..., intent=token)` and sent as the row's `intent`. Until then wolf-access refuses such a row for a resource owned by an org, relationship or project. |
 | **Ownership requests** (M1c-3): `POST /v1/resources/{type}/{id}/ownership`, answered 409 `behind` until wolf-access has applied `after_sequence` | CUT-D1 (4) | a `WolfAccessClient` method taking `after_sequence` from `store.progress().last_sequence`; `behind` and `under_review` already arrive as a `ProblemError` with that `.name`. |
 | **Ownership feed and acknowledgements** (M1c-3): `GET /v1/services/{service}/ownership-changes?after=<cursor>`, applied in feed order with an `ack_ownership` outbox row in the same transaction | CUT-D1 (4) | the action `ack_ownership` is reserved (`Change` refuses it today) and the row's `entry` field is not sent yet; the feed poller will live beside `OutboxRelay`, and the cursor and pre-entry records beside the outbox tables. |
-| **Hints** on WolfNotes searches, dropped while any row is unapplied | CUT-D1 (2), WN-8 | `store.progress()` (`applied_through < last_sequence`) is the test; hints are not read yet ([#31](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/31)). |
+| **Hints** on WolfNotes searches | CUT-D1 (2), WN-8 | Not read yet ([#31](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/31)): the library returns no hint in any mode. When they arrive: `shadow` returns none (it answers exactly like `off`, which makes no decision call); `on` drops every hint while `store.progress()` shows any unapplied row (`applied_through < last_sequence`) and during the restart gate. |
 | **Reconcile snapshot**: `PUT /v1/services/{service}/snapshot` | CUT-D1 (5) | tagged with `store.progress().last_sequence`; `changes_since` shows what reconcile resolved. |
 
 ## Develop

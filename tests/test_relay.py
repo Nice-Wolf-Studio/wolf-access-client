@@ -24,6 +24,8 @@ from wolf_access_client import (
     WolfAccessClient,
 )
 
+from wolf_access_client.relay import MAX_RETRY_AFTER  # noqa: E402
+
 CRED = "svc-credential-not-a-secret"
 CHANGES = "/v1/services/wolfnotes/changes"
 STATE = "/v1/services/wolfnotes/state"
@@ -218,6 +220,38 @@ def test_retry_after_is_honoured(server, intake, sqlite_backend, clock):
     clock.advance(1)
     assert relay.run_once() == 0
     assert intake.applied_through == 1
+
+
+def test_a_retry_after_too_large_to_wait_is_capped_at_an_hour(server, intake, sqlite_backend,
+                                                              clock):
+    """#33: a Retry-After beyond what a thread can wait no longer kills the
+    relay; the wait is capped at MAX_RETRY_AFTER (one hour)."""
+    sqlite_backend.append(create("n-1"))
+    server.queue("POST", CHANGES, Reply(status=503, raw=b"", content_type="text/plain",
+                                        headers={"Retry-After": "99999999999999999999"}))
+    relay = relay_for(server, sqlite_backend.store, clock)
+    assert relay.run_once() == pytest.approx(MAX_RETRY_AFTER) == pytest.approx(3600.0)
+    clock.advance(3600)
+    assert relay.run_once() == 0 and intake.applied_through == 1
+
+
+def test_the_relay_thread_survives_a_huge_retry_after(server, intake, sqlite_backend):
+    sqlite_backend.append(create("n-1"))
+    server.queue("POST", CHANGES, Reply(status=503, raw=b"", content_type="text/plain",
+                                        headers={"Retry-After": "99999999999999999999"}))
+    relay = OutboxRelay(WolfAccessClient(server.url, CRED, service="wolfnotes"),
+                        sqlite_backend.store, mode="off")
+    thread = relay.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not server.sent("POST", CHANGES) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.5)
+        assert thread.is_alive()
+        assert relay.state is RelayState.UNAVAILABLE
+    finally:
+        relay.stop(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_a_failed_state_report_is_retried_before_any_row(server, intake, sqlite_backend,

@@ -18,7 +18,8 @@ Each step (`run_once`):
    resolved it.
 5. On 408, 429, 5xx, a network error or a malformed answer the relay backs
    off exponentially (with jitter, `min_backoff` to `max_backoff`), and
-   never retries before a `Retry-After`. Any other refusal (a wrong
+   never retries before a `Retry-After` (capped at one hour,
+   `MAX_RETRY_AFTER`). Any other refusal (a wrong
    credential or service name) waits `max_backoff` and is logged as an
    error; the rows are kept, so fixing the configuration needs no restart.
    Rows live in the service's own database, so nothing is lost across
@@ -50,6 +51,11 @@ from .mode import AccessMode, safe
 from .models import ChangesAnswer, OutboxRow
 
 log = logging.getLogger("wolf_access_client")
+
+#: The longest a `Retry-After` is waited (one hour, #33): a longer one is
+#: capped, so a broken or hostile header cannot stall the relay or overflow
+#: the thread's wait.
+MAX_RETRY_AFTER = 3600.0
 
 
 class RelayState(str, Enum):
@@ -248,7 +254,7 @@ class OutboxRelay:
             delay = self._backoff()
             retry_after = getattr(exc, "retry_after", None)
             if retry_after is not None:
-                delay = max(delay, float(retry_after))
+                delay = max(delay, min(float(retry_after), MAX_RETRY_AFTER))
             level = logging.WARNING
         else:
             delay, level = self.max_backoff, logging.ERROR
