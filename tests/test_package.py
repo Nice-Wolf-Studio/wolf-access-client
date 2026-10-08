@@ -75,6 +75,9 @@ PUBLIC_API = {
     "PrincipalRef", "RequestFiled", "Permission", "Parent", "Written", "Pending",
     # sign-off of delegate / agent writes (CLI-D4 (ii), CLI-P6)
     "SignoffFiled", "canonical_json", "diff_hash",
+    # topics and hints (WN-D3, API-D5)
+    "Proposed", "Hint", "ResourceSearch", "TopicExample", "TOPIC_LEVELS", "TOPIC_SOURCES",
+    "TOPIC_CATEGORIES",
     # enforcement mode (CUT-D1)
     "AccessMode", "AccessGate", "GateHealth",
     # cut-over: lifecycle outbox and relay (CUT-D1 (1), API-D10)

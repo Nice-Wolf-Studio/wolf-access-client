@@ -273,6 +273,29 @@ class AccessGate:
             return set()
         return set(held)
 
+    def hints(self, hints: Iterable[Any]) -> list[Any]:
+        """The hints to show now (CUT-D1 (2), WN-D3).
+
+        - `on`: all of them once every outbox row is applied and the restart
+          gate is open; none while any row is unapplied (a hint carries no
+          resource id, so no stale resource can be singled out), before the
+          restart gate opens, or when the outbox cannot be read.
+        - `off` and `shadow`: none. Neither answers differently from today,
+          and today has no hints."""
+        items = list(hints)
+        if self._mode is not AccessMode.ON or not items:
+            return []
+        try:
+            progress: OutboxProgress = self._outbox.progress()
+            self._outbox_failure = False
+        except Exception as exc:  # noqa: BLE001  (no hint from what cannot be read)
+            self._outbox_error(exc)
+            return []
+        if not self._restart_gate_open(progress) \
+                or progress.applied_through < progress.last_sequence:
+            return []
+        return items
+
     # --- stale data and the restart gate (CUT-D1 (2)) ------------------------------------
 
     def _held(self, refs: list[ResourceRef]) -> dict[ResourceRef, str]:
