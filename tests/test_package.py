@@ -72,7 +72,7 @@ def test_package_ships_a_py_typed_marker():
 PUBLIC_API = {
     # client and results
     "WolfAccessClient", "Decision", "EvaluationItem", "SEMANTICS", "ResourceRef",
-    "PrincipalRef", "Permission", "Parent", "Written", "Pending",
+    "PrincipalRef", "RequestFiled", "Permission", "Parent", "Written", "Pending",
     # enforcement mode (CUT-D1)
     "AccessMode", "AccessGate", "GateHealth",
     # cut-over: lifecycle outbox and relay (CUT-D1 (1), API-D10)
