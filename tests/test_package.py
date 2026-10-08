@@ -73,6 +73,8 @@ PUBLIC_API = {
     # client and results
     "WolfAccessClient", "Decision", "EvaluationItem", "SEMANTICS", "ResourceRef",
     "PrincipalRef", "RequestFiled", "Permission", "Parent", "Written", "Pending",
+    # sign-off of delegate / agent writes (CLI-D4 (ii), CLI-P6)
+    "SignoffFiled", "canonical_json", "diff_hash",
     # enforcement mode (CUT-D1)
     "AccessMode", "AccessGate", "GateHealth",
     # cut-over: lifecycle outbox and relay (CUT-D1 (1), API-D10)

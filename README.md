@@ -14,7 +14,7 @@ Install it by release tag, the same way as
 is needed:
 
 ```bash
-pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.4.0"
+pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.5.0"
 ```
 
 Python 3.10+, standard library only. The Postgres outbox store works over the DB-API driver
@@ -41,6 +41,8 @@ the service already uses (psycopg2 or psycopg 3); the library does not depend on
 | `update_resource(...)` | `PATCH /v1/resources/{type}/{id}` | `Written` or `Pending` |
 | `delete_resource(...)` | `DELETE /v1/resources/{type}/{id}` | `Written` or `Pending` |
 | `request_access(...)` | `POST /v1/requests` | `RequestFiled(request, continue_token)` |
+| `create_signoff(...)` | `POST /v1/signoffs` | `SignoffFiled(signoff, status, expires_at)` |
+| `consume_signoff(signoff, diff_hash)` | `POST /v1/signoffs/{id}/consume` | `None` (refused: `ConflictError`) |
 | `report_state(mode, registration_start)` | `PUT /v1/services/{service}/state` | `None` |
 | `send_changes(rows)` | `POST /v1/services/{service}/changes` | `ChangesAnswer` |
 | `changes_page(after)` | `GET /v1/services/{service}/changes?after=n` | `ChangesAnswer` (one page, at most 1000 rows) |
@@ -543,6 +545,39 @@ with `applied_through`. `store.unapplied_rows(n)` and `store.progress()` show th
 - The credential must be an RFC 6750 bearer token (no spaces, line breaks or control
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.
+
+## Changes from 0.4.0
+
+Sign-off of a delegate's or agent's write (wolf-access CLI-D4 (ii), CLI-P6, DEL-S1).
+
+- **`Decision.signoff_required`**: an allowed evaluation of a write made through a client bound
+  to an agent whose delegation needs the principal's sign-off for that action
+  (`context.signoff_required`). Hold the write.
+- **`diff_hash(change)`** / **`canonical_json(value)`**: RFC 8785 (JCS) and its SHA-256 (lowercase
+  hex) — the hash of exactly the change you will commit. JSON data only (dict with str keys,
+  list, str, bool, None, int within ±(2**53 − 1), finite float); anything else is a
+  `ValueError`.
+- **`create_signoff(*, user_id, client_id, resource, action, diff_hash)`** → `SignoffFiled`:
+  files the held write for sign-off; `user_id` / `client_id` are the gateway Caller's.
+  wolf-access tells the signer (E18). `ConflictError` when the call is the person's own (an
+  unbound client) or the write needs no sign-off; `ForbiddenError` when it is not allowed.
+- **`consume_signoff(signoff, diff_hash)`**: just before committing, consume the approved
+  sign-off with the same hash. Single use. A pending, rejected, expired or consumed sign-off,
+  or a different hash (the change moved since the preview), is a `ConflictError`: do not
+  commit.
+
+```python
+decision = client.evaluation(user_id=c.user_id, client_id=c.client_id, action="edit",
+                             resource_type="wolfnotes/project", resource_id=project)
+if decision.signoff_required:
+    h = diff_hash(change)
+    filed = client.create_signoff(user_id=c.user_id, client_id=c.client_id,
+                                  resource=ResourceRef("wolfnotes/project", project),
+                                  action="edit", diff_hash=h)
+    hold(change, filed.signoff, h)          # later, once the signer approved:
+    client.consume_signoff(filed.signoff, diff_hash(change))   # ConflictError -> do not commit
+    commit(change)
+```
 
 ## Changes from 0.3.1
 

@@ -83,8 +83,10 @@ from .models import (
     PrincipalRef,
     RequestFiled,
     ResourceRef,
+    SignoffFiled,
     Written,
 )
+from .jcs import diff_hash as _diff_hash  # noqa: F401  (re-exported in __init__)
 
 EVALUATION_PATH = "/access/v1/evaluation"
 EVALUATIONS_PATH = "/access/v1/evaluations"
@@ -94,6 +96,8 @@ SEARCH_SUBJECT_PATH = "/access/v1/search/subject"
 TYPES_PATH = "/v1/types"
 RESOURCES_PATH = "/v1/resources"
 REQUESTS_PATH = "/v1/requests"
+SIGNOFFS_PATH = "/v1/signoffs"
+_HASH = re.compile(r"[0-9a-f]{64}")
 SERVICES_PATH = "/v1/services"
 
 #: `options.evaluations_semantic` values (AuthZEN 1.0).
@@ -610,6 +614,63 @@ class WolfAccessClient:
         if not _nonblank(data.get("request")) or not _nonblank(data.get("continue")):
             raise WolfAccessResponseError("a filing answer has no 'request' and 'continue'")
         return RequestFiled(data["request"], data["continue"])
+
+    # --- sign-off of delegate / agent writes (CLI-D4 (ii), CLI-P6) ----------------------
+
+    def create_signoff(self, *, user_id: str, client_id: str, resource: ResourceRef,
+                       action: str, diff_hash: str) -> SignoffFiled:
+        """File a sign-off for a write the evaluation answered with
+        `signoff_required` (`POST /v1/signoffs`): `user_id` and `client_id`
+        are the gateway Caller's (API-D8); `diff_hash` is
+        `wolf_access_client.diff_hash(change)` of the previewed change.
+        Hold the write; commit it only after `consume_signoff`. A write that
+        needs no sign-off, or a call from an unbound client, is a
+        `ConflictError`; a write not allowed is a `ForbiddenError`."""
+        _require(user_id=user_id, client_id=client_id, action=action)
+        if not isinstance(resource, ResourceRef):
+            raise TypeError("resource must be a ResourceRef")
+        _resource_type(resource.type)
+        _require(resource_id=resource.id)
+        if not isinstance(diff_hash, str) or not _HASH.fullmatch(diff_hash):
+            raise ValueError("diff_hash is the lowercase hex SHA-256 from diff_hash(change)")
+        body = {"resource": {"type": resource.type, "id": resource.id}, "action": action,
+                "diff_hash": diff_hash, "actor": {"client_id": client_id},
+                "on_behalf_of": {"type": "user", "id": user_id}}
+        response = self._request("POST", SIGNOFFS_PATH, _encode(body), max_body=MAX_BODY,
+                                 extra_headers={},
+                                 accept="application/json, application/problem+json")
+        if response.status != 201:
+            if 200 <= response.status < 300:
+                raise WolfAccessResponseError(f"HTTP {response.status} is not a sign-off "
+                                              "answer")
+            raise _problem(response)
+        data = _json_object(response.body)
+        try:
+            expires = datetime.fromisoformat(data["expires_at"])
+        except (KeyError, TypeError, ValueError):
+            raise WolfAccessResponseError("a sign-off answer has no valid 'expires_at'") \
+                from None
+        if not _nonblank(data.get("signoff")) or data.get("status") != "pending" \
+                or expires.tzinfo is None:
+            raise WolfAccessResponseError("a sign-off answer has no pending 'signoff'")
+        return SignoffFiled(data["signoff"], "pending", expires)
+
+    def consume_signoff(self, signoff: str, diff_hash: str) -> None:
+        """Consume an approved sign-off for exactly the previewed change
+        (`POST /v1/signoffs/{id}/consume`), just before committing it. Single
+        use: a pending, rejected, expired or consumed sign-off, or a
+        different hash, is a `ConflictError` — do not commit."""
+        _require(signoff=signoff)
+        if not isinstance(diff_hash, str) or not _HASH.fullmatch(diff_hash):
+            raise ValueError("diff_hash is the lowercase hex SHA-256 from diff_hash(change)")
+        path = f"{SIGNOFFS_PATH}/{quote(signoff, safe='')}/consume"
+        response = self._request("POST", path, _encode({"diff_hash": diff_hash}),
+                                 max_body=MAX_BODY, extra_headers={},
+                                 accept="application/json, application/problem+json")
+        if not 200 <= response.status < 300:
+            raise _problem(response)
+        if _json_object(response.body).get("status") != "consumed":
+            raise WolfAccessResponseError("a consume answer is not 'consumed'")
 
     def _resource_path(self, resource_type: Any, resource_id: Any) -> str:
         service, name = _resource_type(resource_type)
