@@ -4,6 +4,7 @@ when one is wrong (`ValueError`)."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -33,6 +34,14 @@ class Decision:
 
     def __bool__(self) -> bool:
         return self.allowed
+
+    @property
+    def signoff_required(self) -> bool:
+        """An allowed write through a client bound to an agent that needs the
+        delegating principal's sign-off before it commits (wolf-access
+        DEL-S1, CLI-D4 (ii)): hold it, `create_signoff`, and commit only
+        after `consume_signoff` succeeds."""
+        return self.allowed and self.context.get("signoff_required") is True
 
     @property
     def error(self) -> dict[str, Any] | None:
@@ -110,6 +119,17 @@ class RequestFiled:
 
     request: str
     continue_token: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SignoffFiled:
+    """A sign-off waiting for its signer (wolf-access CLI-D4 (ii)): commit the
+    held write only after `consume_signoff(signoff, diff_hash)` succeeds,
+    before `expires_at`."""
+
+    signoff: str
+    status: str
+    expires_at: datetime
 
 
 @dataclass(frozen=True)
