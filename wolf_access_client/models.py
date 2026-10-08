@@ -159,16 +159,27 @@ class ResourceSearch:
     hints: tuple[Hint, ...] = ()
 
 
+#: How an owner example came about (WN-D8): an owner's own level (`set`),
+#: or the owner's answer to an AI proposal (`approved` / `denied`).
+EXAMPLE_DECISIONS = ("set", "approved", "denied")
+
+
 @dataclass(frozen=True)
 class TopicExample:
-    """An owner answer wolf-access keeps as a classification example (WN-7)."""
+    """An owner answer wolf-access keeps as a classification example (WN-7,
+    WN-D8). `topic` is the topic resource's id (of type `topic_type`);
+    `level` is the level the owner set, approved or denied (`decision`): a
+    `denied` example's level is the one that did NOT take effect. `by` is
+    the answering person's gateway user_id (None when wolf-access has none)."""
 
     topic: str
     category: str
     level: str
     reason: str
-    by: str
+    decision: str
+    by: str | None
     at: str
+    topic_type: str = ""
 
 
 # --- the lifecycle outbox (CUT-D1 (1), API-D10) ---------------------------------------

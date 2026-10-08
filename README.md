@@ -574,7 +574,9 @@ Q-T7, Q-T17..Q-T24).
   outbox row is applied and the restart gate is open (a hint has no resource id, so a stale
   resource cannot be singled out, CUT-D1 (2)); `off` and `shadow` show none.
 - **`topic_examples(limit=None)`**: the owner answers wolf-access keeps as classification
-  examples (WN-7), as `TopicExample(topic, category, level, reason, by, at)`.
+  examples (WN-7, WN-D8), as `TopicExample(topic, category, level, reason, decision, by, at,
+  topic_type)`: `decision` is `set` (the owner's own level), `approved` or `denied` (an answer
+  to an AI proposal; a `denied` example's level did not take effect).
 
 ## Changes from 0.3.1
 

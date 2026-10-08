@@ -77,6 +77,7 @@ from .models import (
     ChangesAnswer,
     Decision,
     EvaluationItem,
+    EXAMPLE_DECISIONS,
     TOPIC_CATEGORIES,
     TOPIC_LEVELS,
     TOPIC_SOURCES,
@@ -733,14 +734,7 @@ class WolfAccessClient:
             if not isinstance(items, list) or not isinstance(nxt, str):
                 raise WolfAccessResponseError("an examples page has no 'examples' list "
                                               "or 'next'")
-            out = []
-            for item in items:
-                fields = ("topic", "category", "level", "reason", "by", "at")
-                if not isinstance(item, dict) or not all(
-                        _nonblank(item.get(f)) for f in fields):
-                    raise WolfAccessResponseError("an example is not {topic, category, "
-                                                  "level, reason, by, at}")
-                out.append(TopicExample(*(item[f] for f in fields)))
+            out = [_example(item) for item in items]
             yield from out
             if not nxt:
                 return
@@ -966,6 +960,21 @@ def _check_search(body: dict[str, Any], page_size: Any) -> None:
             page_size, int) or not 1 <= page_size <= PAGE_MAX):
         raise ValueError(f"page_size must be an integer from 1 to {PAGE_MAX}")
     _encode(body)  # an unserializable context is refused now, not at the first page
+
+
+def _example(item: Any) -> TopicExample:
+    """`{topic: {type, id}, category, level, reason, decision, by, at}` (WN-D8)."""
+    fields = ("category", "level", "reason", "decision", "at")
+    topic = item.get("topic") if isinstance(item, dict) else None
+    if not isinstance(topic, dict) or not _nonblank(topic.get("id")) \
+            or not _nonblank(topic.get("type")) \
+            or not all(_nonblank(item.get(f)) for f in fields) \
+            or item["decision"] not in EXAMPLE_DECISIONS \
+            or not (item.get("by") is None or _nonblank(item.get("by"))):
+        raise WolfAccessResponseError("an example is not {topic, category, level, reason, "
+                                      "decision, by, at}")
+    return TopicExample(topic["id"], item["category"], item["level"], item["reason"],
+                        item["decision"], item.get("by"), item["at"], topic["type"])
 
 
 _HINT_KEYS = frozenset(("person", "topic", "hint"))

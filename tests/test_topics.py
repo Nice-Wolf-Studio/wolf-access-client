@@ -245,18 +245,21 @@ def test_a_hint_request_names_the_handle(server):
 
 # --- owner answers kept as examples (WN-7) ---------------------------------------------
 
-EX = {"topic": "t-1", "category": "health", "level": "hidden", "reason": "r", "by": "user-1",
+EX = {"topic": {"type": "wolfnotes/topic", "id": "t-1"}, "category": "health",
+      "level": "hidden", "reason": "r", "decision": "set", "by": "user-1",
       "at": "2026-10-08T10:00:00Z"}
 
 
 def test_a66_topic_examples_pages_through_the_cursor(server):
     server.queue("GET", EXAMPLES, Reply(body={"examples": [EX], "next": "c-1"}))
     server.queue("GET", EXAMPLES, Reply(body={"examples": [
-        {**EX, "topic": "t-2"}], "next": ""}))
+        {**EX, "topic": {"type": "wolfnotes/topic", "id": "t-2"}, "decision": "denied",
+         "by": None}], "next": ""}))
     got = list(client(server).topic_examples())
     assert [e.topic for e in got] == ["t-1", "t-2"]
-    assert got[0] == TopicExample("t-1", "health", "hidden", "r", "user-1",
-                                  "2026-10-08T10:00:00Z")
+    assert got[0] == TopicExample("t-1", "health", "hidden", "r", "set", "user-1",
+                                  "2026-10-08T10:00:00Z", "wolfnotes/topic")
+    assert (got[1].decision, got[1].by) == ("denied", None)
     assert [s.path for s in server.requests] == [EXAMPLES, EXAMPLES + "?after=c-1"]
 
 
@@ -268,8 +271,11 @@ def test_topic_examples_limit(server):
         list(client(server).topic_examples(limit=0))
 
 
-def test_a_malformed_example_page_is_a_response_error(server):
-    server.queue("GET", EXAMPLES, Reply(body={"examples": [{"topic": "t"}], "next": ""}))
+@pytest.mark.parametrize("bad", [{"topic": "t"}, {**EX, "topic": "t-1"},
+                                 {**EX, "decision": "maybe"}, {**EX, "by": ""},
+                                 {**EX, "reason": ""}])
+def test_a_malformed_example_page_is_a_response_error(server, bad):
+    server.queue("GET", EXAMPLES, Reply(body={"examples": [bad], "next": ""}))
     with pytest.raises(WolfAccessResponseError):
         list(client(server).topic_examples())
 
