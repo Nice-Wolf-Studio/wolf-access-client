@@ -77,12 +77,19 @@ from .models import (
     ChangesAnswer,
     Decision,
     EvaluationItem,
+    TOPIC_CATEGORIES,
+    TOPIC_LEVELS,
+    TOPIC_SOURCES,
+    Hint,
     Parent,
     Pending,
     Permission,
     PrincipalRef,
+    Proposed,
     RequestFiled,
     ResourceRef,
+    ResourceSearch,
+    TopicExample,
     Written,
 )
 
@@ -365,6 +372,35 @@ class WolfAccessClient:
             return ResourceRef(resource_type, item["id"])
         return self._search(SEARCH_RESOURCE_PATH, body, page_size, parse)
 
+    def search_resources_with_hints(self, *, user_id: str, client_id: str, action: str,
+                                    resource_type: str, page_size: int | None = None,
+                                    context: Mapping[str, Any] | None = None,
+                                    zedtoken: str | None = None) -> ResourceSearch:
+        """`search_resources`, every page fetched now, plus the hints the
+        pages carried in `context.hints` (API-D5, WN-D3). A hint is kept only
+        if it is exactly `{person, topic, hint}`, three non-empty strings: one
+        carrying anything else (a title, content, a count, a score) is dropped
+        (WN-8, WN-P2). Nothing else from the response context is returned.
+        Show hints only through `AccessGate.hints` (CUT-D1 (2)). Any failure
+        raises: there is never a partial answer."""
+        _require(user_id=user_id, action=action, resource_type=resource_type)
+        body = {"subject": {"type": "user", "id": user_id},
+                "action": {"name": action},
+                "resource": {"type": resource_type},
+                "context": self._context(client_id, context, zedtoken)}
+        _check_search(body, page_size)
+        resources: list[ResourceRef] = []
+        hints: list[Hint] = []
+        for data, results in self._raw_pages(SEARCH_RESOURCE_PATH, body, page_size):
+            for item in results:
+                if not isinstance(item, dict) or item.get("type") != resource_type \
+                        or not _nonblank(item.get("id")):
+                    raise WolfAccessResponseError(
+                        f"a result is not a {resource_type} reference")
+                resources.append(ResourceRef(resource_type, item["id"]))
+            hints.extend(_hints(data))
+        return ResourceSearch(tuple(resources), tuple(dict.fromkeys(hints)))
+
     def search_actions(self, *, user_id: str, client_id: str, resource_type: str,
                        resource_id: str, page_size: int | None = None,
                        context: Mapping[str, Any] | None = None,
@@ -437,14 +473,17 @@ class WolfAccessClient:
 
     def _search(self, path: str, body: dict[str, Any], page_size: Any,
                 parse: Callable[[Any], T]) -> Iterator[T]:
-        if page_size is not None and (isinstance(page_size, bool) or not isinstance(
-                page_size, int) or not 1 <= page_size <= PAGE_MAX):
-            raise ValueError(f"page_size must be an integer from 1 to {PAGE_MAX}")
-        _encode(body)  # an unserializable context is refused now, not at the first page
+        _check_search(body, page_size)
         return self._pages(path, body, page_size, parse)
 
     def _pages(self, path: str, body: dict[str, Any], page_size: int | None,
                parse: Callable[[Any], T]) -> Iterator[T]:
+        for _data, results in self._raw_pages(path, body, page_size):
+            items = [parse(item) for item in results]
+            yield from items
+
+    def _raw_pages(self, path: str, body: dict[str, Any], page_size: int | None
+                   ) -> Iterator[tuple[dict[str, Any], list[Any]]]:
         token: str | None = None
         seen: set[str] = set()
         while True:
@@ -458,8 +497,7 @@ class WolfAccessClient:
             results, next_token = _search_page(data)
             if next_token and next_token in seen:
                 raise WolfAccessResponseError("wolf-access repeated a page token")
-            items = [parse(item) for item in results]
-            yield from items
+            yield data, results
             if not next_token:
                 return
             seen.add(next_token)
@@ -610,6 +648,106 @@ class WolfAccessClient:
         if not _nonblank(data.get("request")) or not _nonblank(data.get("continue")):
             raise WolfAccessResponseError("a filing answer has no 'request' and 'continue'")
         return RequestFiled(data["request"], data["continue"])
+
+    def set_topic_level(self, resource_type: str, resource_id: str, topic: str, *,
+                        level: str, reason: str, source: str, category: str,
+                        user_id: str | None = None,
+                        client_id: str | None = None) -> Written | Pending | Proposed:
+        """Set the level of one topic of a resource (`PUT /v1/resources/{type}/
+        {id}/topics/{topic}`, API-D3, WN-D3): `topic` is the topic child's
+        resource id, `level` readable / hinted / hidden with a non-empty
+        `reason` (WN-2) and the topic's `category` (WN-4). `needs_input` is
+        never a level (WN-6): ask the owner instead.
+
+        `source="ai"`: the service's classifier. A tightening applies
+        (`Written` / `Pending`); a loosening, or a level above the scope's
+        ceiling, answers `Proposed` and waits for the owner (WN-5, WN-D1).
+        `source="owner"`: the owner's answer, with the gateway Caller's
+        `user_id` and `client_id`; wolf-access checks the person and keeps it
+        as an example (WN-7). Above the ceiling it is a 422 `above_ceiling`
+        `ProblemError`. The topic is set directly, never through the outbox
+        (Q-T7)."""
+        if level not in TOPIC_LEVELS:
+            raise ValueError("level must be one of " + ", ".join(TOPIC_LEVELS) + (
+                ": needs_input is never a level; ask the owner (WN-6)"
+                if level == "needs_input" else ""))
+        if not _nonblank(reason):
+            raise ValueError("a topic level needs a non-empty reason (WN-2)")
+        if source not in TOPIC_SOURCES:
+            raise ValueError("source must be one of " + ", ".join(TOPIC_SOURCES))
+        if category not in TOPIC_CATEGORIES:
+            raise ValueError("category must be one of " + ", ".join(TOPIC_CATEGORIES))
+        body: dict[str, Any] = {"level": level, "reason": reason, "source": source,
+                                "category": category}
+        if source == "owner":
+            _require(user_id=user_id, client_id=client_id)
+            body.update(user_id=user_id, client_id=client_id)
+        elif user_id is not None or client_id is not None:
+            raise ValueError("an ai level names no user_id or client_id")
+        _require(topic=topic)
+        path = (self._resource_path(resource_type, resource_id) + "/topics/" +
+                quote(topic, safe=""))
+        response = self._request("PUT", path, _encode(body), max_body=MAX_BODY,
+                                 accept="application/json, application/problem+json")
+        if not 200 <= response.status < 300:
+            raise _problem(response)
+        if response.status == 202:
+            data = _json_object(response.body)
+            if data.get("status") == "proposed":
+                if not _nonblank(data.get("proposal")):
+                    raise WolfAccessResponseError("a proposed answer has no 'proposal'")
+                return Proposed(data["proposal"])
+        result = _write_result(response.status, response.body)
+        if isinstance(result, Written) and result.zedtoken:
+            self._zedtoken = result.zedtoken
+        return result
+
+    def topic_examples(self, *, limit: int | None = None) -> Iterator[TopicExample]:
+        """The owner answers wolf-access keeps as classification examples
+        (WN-7; `GET /v1/services/{service}/topic-examples`), oldest first, a
+        page at a time as the iterator is consumed. A failure raises from the
+        iterator."""
+        path = self._service_path("topic-examples")
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
+                                  or not 1 <= limit <= PAGE_MAX):
+            raise ValueError(f"limit must be an integer from 1 to {PAGE_MAX}")
+        return self._example_pages(path, limit)
+
+    def _example_pages(self, path: str, limit: int | None) -> Iterator[TopicExample]:
+        after = ""
+        seen: set[str] = set()
+        while True:
+            query = [f"after={quote(after, safe='')}"] if after else []
+            if limit is not None:
+                query.append(f"limit={limit}")
+            url = path + ("?" + "&".join(query) if query else "")
+            response = self._request("GET", url, None, max_body=MAX_SEARCH_BODY,
+                                     accept="application/json, application/problem+json")
+            if response.status != 200:
+                if 200 <= response.status < 300:
+                    raise WolfAccessResponseError(f"HTTP {response.status} is not an "
+                                                  "examples page")
+                raise _problem(response)
+            data = _json_object(response.body)
+            items, nxt = data.get("examples"), data.get("next")
+            if not isinstance(items, list) or not isinstance(nxt, str):
+                raise WolfAccessResponseError("an examples page has no 'examples' list "
+                                              "or 'next'")
+            out = []
+            for item in items:
+                fields = ("topic", "category", "level", "reason", "by", "at")
+                if not isinstance(item, dict) or not all(
+                        _nonblank(item.get(f)) for f in fields):
+                    raise WolfAccessResponseError("an example is not {topic, category, "
+                                                  "level, reason, by, at}")
+                out.append(TopicExample(*(item[f] for f in fields)))
+            yield from out
+            if not nxt:
+                return
+            if nxt in seen:
+                raise WolfAccessResponseError("wolf-access repeated a cursor")
+            seen.add(nxt)
+            after = nxt
 
     def _resource_path(self, resource_type: Any, resource_id: Any) -> str:
         service, name = _resource_type(resource_type)
@@ -821,6 +959,34 @@ def _search_page(data: dict[str, Any]) -> tuple[list[Any], str]:
             or not isinstance(count, int) or count != len(results):
         raise WolfAccessResponseError("a search page's 'page' is malformed")
     return results, next_token
+
+
+def _check_search(body: dict[str, Any], page_size: Any) -> None:
+    if page_size is not None and (isinstance(page_size, bool) or not isinstance(
+            page_size, int) or not 1 <= page_size <= PAGE_MAX):
+        raise ValueError(f"page_size must be an integer from 1 to {PAGE_MAX}")
+    _encode(body)  # an unserializable context is refused now, not at the first page
+
+
+_HINT_KEYS = frozenset(("person", "topic", "hint"))
+
+
+def _hints(data: dict[str, Any]) -> list[Hint]:
+    """The well-formed hints of one search page (WN-8): exactly person,
+    topic and handle, each a non-empty string; any other is dropped."""
+    context = data.get("context")
+    if context is None:
+        return []
+    if not isinstance(context, dict):
+        raise WolfAccessResponseError("a search page's 'context' is not an object")
+    hints = context.get("hints")
+    if hints is None:
+        return []
+    if not isinstance(hints, list):
+        raise WolfAccessResponseError("a search page's 'hints' is not a list")
+    return [Hint(h["person"], h["topic"], h["hint"]) for h in hints
+            if isinstance(h, dict) and set(h) == _HINT_KEYS
+            and all(_nonblank(h[k]) for k in _HINT_KEYS)]
 
 
 def _parent_ref(parent: Any) -> dict[str, str]:

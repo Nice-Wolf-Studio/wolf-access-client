@@ -36,22 +36,32 @@ from .models import (
     OutboxProgress,
     OutboxRow,
     Parent,
+    TOPIC_CATEGORIES,
+    TOPIC_LEVELS,
+    TOPIC_SOURCES,
+    Hint,
     Pending,
     Permission,
     PrincipalRef,
+    Proposed,
     RequestFiled,
     ResourceRef,
+    ResourceSearch,
+    TopicExample,
     Written,
 )
 from .outbox import OutboxStore, PostgresOutboxStore, SQLiteOutboxStore
 from .relay import OutboxRelay, RelayState
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     # client and values
     "WolfAccessClient", "Decision", "EvaluationItem", "SEMANTICS", "ResourceRef",
     "PrincipalRef", "RequestFiled", "Permission", "Parent", "Written", "Pending",
+    # topics and hints (WN-D3, API-D5)
+    "Proposed", "Hint", "ResourceSearch", "TopicExample", "TOPIC_LEVELS", "TOPIC_SOURCES",
+    "TOPIC_CATEGORIES",
     # enforcement mode (CUT-D1)
     "AccessMode", "AccessGate", "GateHealth",
     # cut-over: lifecycle outbox and relay (CUT-D1 (1), API-D10)

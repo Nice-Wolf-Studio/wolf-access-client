@@ -14,7 +14,7 @@ Install it by release tag, the same way as
 is needed:
 
 ```bash
-pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.4.0"
+pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.5.0"
 ```
 
 Python 3.10+, standard library only. The Postgres outbox store works over the DB-API driver
@@ -34,6 +34,7 @@ the service already uses (psycopg2 or psycopg 3); the library does not depend on
 | `evaluation(...)` | `POST /access/v1/evaluation` | `Decision` |
 | `evaluations(...)` | `POST /access/v1/evaluations` | `list[Decision]`, one per item |
 | `search_resources(...)` | `POST /access/v1/search/resource` | iterator of `ResourceRef` |
+| `search_resources_with_hints(...)` | `POST /access/v1/search/resource`, every page | `ResourceSearch(resources, hints)` |
 | `search_actions(...)` | `POST /access/v1/search/action` | iterator of action names |
 | `search_subjects(...)` | `POST /access/v1/search/subject` | iterator of gateway `user_id`s |
 | `register_type(...)` | `PUT /v1/types/{service}/{type}` | `Written` or `Pending` |
@@ -41,6 +42,8 @@ the service already uses (psycopg2 or psycopg 3); the library does not depend on
 | `update_resource(...)` | `PATCH /v1/resources/{type}/{id}` | `Written` or `Pending` |
 | `delete_resource(...)` | `DELETE /v1/resources/{type}/{id}` | `Written` or `Pending` |
 | `request_access(...)` | `POST /v1/requests` | `RequestFiled(request, continue_token)` |
+| `set_topic_level(...)` | `PUT /v1/resources/{type}/{id}/topics/{topic}` | `Written`, `Pending` or `Proposed(proposal)` |
+| `topic_examples(limit=None)` | `GET /v1/services/{service}/topic-examples`, every page | iterator of `TopicExample` |
 | `report_state(mode, registration_start)` | `PUT /v1/services/{service}/state` | `None` |
 | `send_changes(rows)` | `POST /v1/services/{service}/changes` | `ChangesAnswer` |
 | `changes_page(after)` | `GET /v1/services/{service}/changes?after=n` | `ChangesAnswer` (one page, at most 1000 rows) |
@@ -543,6 +546,35 @@ with `applied_through`. `store.unapplied_rows(n)` and `store.progress()` show th
 - The credential must be an RFC 6750 bearer token (no spaces, line breaks or control
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.
+
+## Changes from 0.4.0
+
+Topics and hints (wolf-access M7: WN-2..WN-8, WN-D3, SCP-D2, API-D3, API-D5; decisions
+Q-T7, Q-T17..Q-T24).
+
+- **`set_topic_level(type, id, topic, *, level, reason, source, category, user_id=None,
+  client_id=None)`** sets one topic's level (`PUT /v1/resources/{type}/{id}/topics/{topic}`).
+  `topic` is the topic child's resource id; `level` is `readable`, `hinted` or `hidden`
+  (`needs_input` is never a level: ask the owner, WN-6) with a non-empty `reason` (WN-2);
+  `category` is `people`, `money`, `health`, `legal` or `other` (WN-4). `source="ai"` is the
+  service's classifier: a tightening applies (`Written` / `Pending`); a loosening, or a level
+  above the scope's ceiling, answers `Proposed(proposal)` and waits for the owner (WN-5,
+  WN-D1). `source="owner"` is the owner's answer and needs the gateway Caller's `user_id` and
+  `client_id`; above the ceiling it is a 422 `above_ceiling` `ProblemError`. Levels are set
+  directly, never through the outbox (Q-T7).
+- **`Change.create_topic(topic, *, note, owner, author)`**: the topic child resource, created
+  through the outbox under its note (Q-T7), with the note's owner and author. Its id must be
+  opaque (no note id, no title): hints show it. Before a note's `delete` row, append a
+  `delete` row for each of its topics (wolf-access does not cascade).
+- **`search_resources_with_hints(...)`**: `search_resources`, every page fetched now, plus
+  `context.hints` as `Hint(person, topic, hint)`. A hint carrying anything else (a title,
+  content, a count, a score) is dropped (WN-8, WN-P2). Pass `hint.hint` to
+  `request_access(hint=...)` to ask for that topic (SCP-D2).
+- **`AccessGate.hints(hints)`**: the hints to show now. `on` shows them only while every
+  outbox row is applied and the restart gate is open (a hint has no resource id, so a stale
+  resource cannot be singled out, CUT-D1 (2)); `off` and `shadow` show none.
+- **`topic_examples(limit=None)`**: the owner answers wolf-access keeps as classification
+  examples (WN-7), as `TopicExample(topic, category, level, reason, by, at)`.
 
 ## Changes from 0.3.1
 

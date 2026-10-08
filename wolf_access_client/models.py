@@ -120,6 +120,57 @@ class Pending:
     status: str = "pending"
 
 
+@dataclass(frozen=True)
+class Proposed:
+    """HTTP 202 to an AI topic level (WN-5, WN-D1): a loosening, or a level
+    above the scope's ceiling, that does not apply until the owner decides
+    `proposal` (wolfaccess_decide_topic_proposal, or an owner `set_topic_level`)."""
+
+    proposal: str
+    status: str = "proposed"
+
+
+#: The levels a topic can hold (WN-2). `needs_input` is never one (WN-6).
+TOPIC_LEVELS = ("readable", "hinted", "hidden")
+#: Who set a topic level: the service's classifier, or the owner answering it.
+TOPIC_SOURCES = ("ai", "owner")
+#: What a topic is about; people / money / health / legal default to hidden (WN-4).
+TOPIC_CATEGORIES = ("people", "money", "health", "legal", "other")
+
+
+@dataclass(frozen=True)
+class Hint:
+    """One hint from a resource search (API-D5): a person and a topic only,
+    never a title, content, count or score (WN-8, WN-P2). `hint` is the
+    opaque handle a request may name (`request_access(hint=...)`, SCP-D2);
+    it is valid only for the person it was shown to."""
+
+    person: str
+    topic: str
+    hint: str
+
+
+@dataclass(frozen=True)
+class ResourceSearch:
+    """`search_resources_with_hints`: every page's resources, in order, and
+    the hints the pages carried. Never a total, never a score."""
+
+    resources: tuple["ResourceRef", ...]
+    hints: tuple[Hint, ...] = ()
+
+
+@dataclass(frozen=True)
+class TopicExample:
+    """An owner answer wolf-access keeps as a classification example (WN-7)."""
+
+    topic: str
+    category: str
+    level: str
+    reason: str
+    by: str
+    at: str
+
+
 # --- the lifecycle outbox (CUT-D1 (1), API-D10) ---------------------------------------
 
 #: The lifecycle actions a service writes to its outbox. `ack_ownership`
@@ -214,6 +265,17 @@ class Change:
                parent: ResourceRef | None = None, private: bool | None = None) -> "Change":
         return cls("create", resource, parent=parent, private=private, owner=owner,
                    author=author)
+
+    @classmethod
+    def create_topic(cls, topic: ResourceRef, *, note: ResourceRef, owner: PrincipalRef,
+                     author: str) -> "Change":
+        """A topic child resource (WN-D3), created through the outbox under its
+        note (Q-T7): `owner` is the note's owner and `author` the note's author
+        (owner and author reach hidden topics through it). The topic id must
+        be opaque: no note id, no title (it is shown in hints)."""
+        if not isinstance(note, ResourceRef):
+            raise ValueError("a topic's note is a ResourceRef")
+        return cls.create(topic, owner=owner, author=author, parent=note)
 
     @classmethod
     def move(cls, resource: ResourceRef, *, parent: ResourceRef | None,
