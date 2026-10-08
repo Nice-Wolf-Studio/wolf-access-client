@@ -81,6 +81,7 @@ from .models import (
     Pending,
     Permission,
     PrincipalRef,
+    RequestFiled,
     ResourceRef,
     Written,
 )
@@ -92,6 +93,7 @@ SEARCH_ACTION_PATH = "/access/v1/search/action"
 SEARCH_SUBJECT_PATH = "/access/v1/search/subject"
 TYPES_PATH = "/v1/types"
 RESOURCES_PATH = "/v1/resources"
+REQUESTS_PATH = "/v1/requests"
 SERVICES_PATH = "/v1/services"
 
 #: `options.evaluations_semantic` values (AuthZEN 1.0).
@@ -544,6 +546,70 @@ class WolfAccessClient:
         """Delete a resource and all its relations. Its id stays a tombstone:
         creating it again is a `ConflictError`."""
         return self._write("DELETE", self._resource_path(resource_type, resource_id), None)
+
+    def request_access(self, *, user_id: str, client_id: str, role: str,
+                       resource: ResourceRef | PrincipalRef | None = None,
+                       scope: Mapping[str, Any] | None = None, hint: str | None = None,
+                       reason: str | None = None,
+                       idempotency_key: str | None = None) -> RequestFiled:
+        """File an access request for the person the service is serving
+        (`POST /v1/requests`, REQ-D1): `user_id` and `client_id` are the
+        gateway Caller's (API-D8, CLI-P1). The target is exactly one of
+        `resource` (a `ResourceRef` of the service's own type, or a
+        `PrincipalRef` of an org / relationship / project for a membership),
+        `scope` (RFC 9396 `authorization_details`, SCP-D3) or `hint` (a hint
+        handle the person was shown). wolf-access stores and decides it; the
+        answer is the same whether or not the target exists (REQ-D5). A
+        resubmit inside the cooldown is a `ConflictError`; another service's
+        type is a `ForbiddenError`."""
+        _require(user_id=user_id, client_id=client_id, role=role)
+        given = [t for t in (resource, scope, hint) if t is not None]
+        if len(given) != 1:
+            raise ValueError("give exactly one of resource, scope or hint")
+        if isinstance(resource, ResourceRef):
+            _resource_type(resource.type)
+            _require(resource_id=resource.id)
+            target: dict[str, Any] = {"resource": {"type": resource.type, "id": resource.id}}
+        elif isinstance(resource, PrincipalRef):
+            if resource.type not in ("org", "relationship", "project"):
+                raise ValueError("a principal target is an org, relationship or project")
+            _require(principal_id=resource.id)
+            target = {"resource": {"type": resource.type, "id": resource.id}}
+        elif resource is not None:
+            raise ValueError("resource must be a ResourceRef or PrincipalRef")
+        elif scope is not None:
+            if not isinstance(scope, Mapping) or not _nonblank(scope.get("type")) \
+                    or not isinstance(scope.get("locations"), Sequence) \
+                    or isinstance(scope.get("locations"), str) or not scope["locations"]:
+                raise ValueError("scope is authorization_details with type and locations")
+            target = {"scope": dict(scope)}
+        else:
+            _require(hint=hint)
+            target = {"hint": hint}
+        body: dict[str, Any] = {"user_id": user_id, "client_id": client_id,
+                                "target": target, "role": role}
+        if reason is not None:
+            _require(reason=reason)
+            body["reason"] = reason
+        headers = {}
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not _IDEMPOTENCY_KEY.fullmatch(
+                    idempotency_key):
+                raise ValueError("idempotency_key must be printable ASCII without "
+                                 "leading or trailing whitespace")
+            headers["Idempotency-Key"] = idempotency_key
+        response = self._request("POST", REQUESTS_PATH, _encode(body), max_body=MAX_BODY,
+                                 extra_headers=headers,
+                                 accept="application/json, application/problem+json")
+        if response.status != 201:
+            if 200 <= response.status < 300:
+                raise WolfAccessResponseError(f"HTTP {response.status} is not a filing "
+                                              "answer")
+            raise _problem(response)
+        data = _json_object(response.body)
+        if not _nonblank(data.get("request")) or not _nonblank(data.get("continue")):
+            raise WolfAccessResponseError("a filing answer has no 'request' and 'continue'")
+        return RequestFiled(data["request"], data["continue"])
 
     def _resource_path(self, resource_type: Any, resource_id: Any) -> str:
         service, name = _resource_type(resource_type)

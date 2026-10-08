@@ -102,6 +102,17 @@ class Written:
 
 
 @dataclass(frozen=True)
+class RequestFiled:
+    """A filed access request (REQ-D5): the stable `request` handle and the
+    requester's single-use `continue` token (REQ-D6), the same answer whether
+    or not the target exists. The token is a secret for the requester: hand
+    it to them, never log it (it is left out of `repr`)."""
+
+    request: str
+    continue_token: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class Pending:
     """HTTP 202: the write is committed but its relationships are not applied
     yet (EVT-D3). Until they are, wolf-access fails every check closed."""

@@ -14,7 +14,7 @@ Install it by release tag, the same way as
 is needed:
 
 ```bash
-pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.3.1"
+pip install "git+https://github.com/Nice-Wolf-Studio/wolf-access-client@v0.4.0"
 ```
 
 Python 3.10+, standard library only. The Postgres outbox store works over the DB-API driver
@@ -40,6 +40,7 @@ the service already uses (psycopg2 or psycopg 3); the library does not depend on
 | `create_resource(...)` | `POST /v1/resources` | `Written` or `Pending` |
 | `update_resource(...)` | `PATCH /v1/resources/{type}/{id}` | `Written` or `Pending` |
 | `delete_resource(...)` | `DELETE /v1/resources/{type}/{id}` | `Written` or `Pending` |
+| `request_access(...)` | `POST /v1/requests` | `RequestFiled(request, continue_token)` |
 | `report_state(mode, registration_start)` | `PUT /v1/services/{service}/state` | `None` |
 | `send_changes(rows)` | `POST /v1/services/{service}/changes` | `ChangesAnswer` |
 | `changes_page(after)` | `GET /v1/services/{service}/changes?after=n` | `ChangesAnswer` (one page, at most 1000 rows) |
@@ -542,6 +543,20 @@ with `applied_through`. `store.unapplied_rows(n)` and `store.progress()` show th
 - The credential must be an RFC 6750 bearer token (no spaces, line breaks or control
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.
+
+## Changes from 0.3.1
+
+- **`request_access(*, user_id, client_id, role, resource=None, scope=None, hint=None,
+  reason=None, idempotency_key=None)`** files an access request for the person the service
+  is serving (`POST /v1/requests`, REQ-D1). `user_id` and `client_id` are the gateway
+  `Caller`'s, never an argument from a tool (API-D8, CLI-P1). The target is exactly one of
+  `resource` (a `ResourceRef` of the service's own type, or a `PrincipalRef` of an org,
+  relationship or project), `scope` (RFC 9396 `authorization_details`) or `hint`. wolf-access
+  stores and decides the request: the service keeps no request or approval state. The answer,
+  `RequestFiled(request, continue_token)`, is the same whether or not the target exists; the
+  `continue_token` is the requester's single-use secret (kept out of `repr`). A resubmit inside
+  the cooldown is a `ConflictError`; another service's type is a `ForbiddenError`. With
+  `idempotency_key`, a repeat returns the same `request` with a fresh token.
 
 ## Changes from 0.3.0
 
