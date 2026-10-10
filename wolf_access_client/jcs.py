@@ -1,6 +1,6 @@
-"""RFC 8785 JSON Canonicalization Scheme (JCS) and the sign-off diff hash
-(wolf-access CLI-D4: the service canonicalizes the previewed change with
-JCS and hashes it with SHA-256).
+"""RFC 8785 JSON Canonicalization Scheme (JCS) and `diff_hash`, the SHA-256
+of a value's JCS form. Standalone helpers: the 0.5.0 sign-off calls they
+were written for are gone with the routes (0.7.0).
 
 `canonical_json` accepts the JSON data model only: dict with str keys,
 list / tuple, str, bool, None, int within ±(2**53 - 1) (an I-JSON number,

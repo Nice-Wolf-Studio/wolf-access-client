@@ -1,50 +1,38 @@
-"""RFC 9457 problem details from `/v1` (API-D3), parsed into typed
-exceptions by name (`urn:wolfaccess:problem:<name>`), plus `Retry-After`."""
+"""RFC 9457 problem details from `/v1` (wolf-access `api.py` `_render`:
+`type` = `urn:wolfaccess:problem:<name>`), parsed into typed exceptions by
+name, plus `Retry-After`."""
 import copy
 import pickle
 
 import pytest
 
 from tests.fake_server import PROBLEM, FakeWolfAccess, Reply, problem
+from tests.helpers import ORG, make
 from wolf_access_client import (
     PROBLEM_TYPES,
     AccessUnavailable,
     BadRequestError,
     ConflictError,
     ForbiddenError,
-    HttpsRequiredError,
-    IdempotencyKeyInUseError,
-    IdempotencyKeyReusedError,
     NotFoundError,
-    OwnerRequiredError,
-    OwnershipMismatchError,
-    PrincipalRef,
     ProblemError,
-    RateLimitedError,
     UnauthorizedError,
     UnavailableError,
-    UseOutboxError,
-    WolfAccessClient,
     WolfAccessError,
     WolfAccessHTTPError,
 )
 
 CRED = "svc-credential-not-a-secret"
 
+# Every problem wolf-access `development` renders (`api.py` `_STATUS`), but
+# `internal` (500), which arrives as a plain ProblemError with its name.
 NAMES = [
-    ("owner_required", 422, OwnerRequiredError, False),
-    ("ownership_mismatch", 422, OwnershipMismatchError, False),
-    ("conflict", 409, ConflictError, False),
-    ("forbidden", 403, ForbiddenError, False),
-    ("not_found", 404, NotFoundError, False),
     ("bad_request", 400, BadRequestError, False),
     ("unauthorized", 401, UnauthorizedError, False),
-    ("https_required", 403, HttpsRequiredError, False),
-    ("rate_limited", 429, RateLimitedError, True),
+    ("forbidden", 403, ForbiddenError, False),
+    ("not_found", 404, NotFoundError, False),
+    ("conflict", 409, ConflictError, False),
     ("unavailable", 503, UnavailableError, True),
-    ("idempotency_key_reused", 422, IdempotencyKeyReusedError, False),
-    ("idempotency_key_in_use", 409, IdempotencyKeyInUseError, True),
-    ("use_outbox", 409, UseOutboxError, False),
 ]
 
 
@@ -55,15 +43,14 @@ def server():
 
 
 def create(client):
-    return client.create_resource("wolfnotes/note", "n-1", owner=PrincipalRef.user("user-1"),
-                                  author="user-1", idempotency_key="k-1")
+    return client.create_resource(ORG, name="Home")
 
 
 @pytest.mark.parametrize("name, status, cls, retryable", NAMES)
 def test_each_problem_name_is_its_own_exception(server, name, status, cls, retryable):
     server.reply = problem(name, status, f"detail for {name}")
     with pytest.raises(cls) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     err = exc.value
     assert type(err) is cls and PROBLEM_TYPES[name] is cls
     assert isinstance(err, ProblemError) and isinstance(err, WolfAccessHTTPError)
@@ -73,7 +60,7 @@ def test_each_problem_name_is_its_own_exception(server, name, status, cls, retry
     assert err.retryable is retryable
 
 
-def test_problem_names_cover_the_m1b_and_m1c1_api():
+def test_problem_names_cover_the_development_api():
     assert sorted(PROBLEM_TYPES) == sorted(n for n, *_ in NAMES)
 
 
@@ -81,15 +68,23 @@ def test_unauthorized_keeps_the_challenge(server):
     server.reply = problem("unauthorized", 401, "a service credential is required",
                            WWW_Authenticate='Bearer realm="wolf-access"')
     with pytest.raises(UnauthorizedError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert exc.value.www_authenticate == 'Bearer realm="wolf-access"'
 
 
-def test_rate_limited_carries_retry_after(server):
-    server.reply = problem("rate_limited", 429, "too many requests (API-S1)", Retry_After="42")
-    with pytest.raises(RateLimitedError) as exc:
-        create(WolfAccessClient(server.url, CRED))
-    assert exc.value.retry_after == 42.0 and exc.value.retryable
+def test_unavailable_carries_retry_after(server):
+    server.reply = problem("unavailable", 503, "SpiceDB is unreachable", Retry_After="5")
+    with pytest.raises(UnavailableError) as exc:
+        create(make(server.url))
+    assert exc.value.retry_after == 5.0 and exc.value.retryable
+
+
+def test_internal_is_a_plain_problem_with_its_name(server):
+    server.reply = problem("internal", 500, "internal error")
+    with pytest.raises(ProblemError) as exc:
+        create(make(server.url))
+    assert type(exc.value) is ProblemError and exc.value.name == "internal"
+    assert exc.value.retryable
 
 
 @pytest.mark.parametrize("value, expected", [
@@ -100,7 +95,7 @@ def test_rate_limited_carries_retry_after(server):
 def test_retry_after_is_seconds_or_an_http_date(server, value, expected):
     server.reply = problem("unavailable", 503, "later", Retry_After=value)
     with pytest.raises(UnavailableError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert exc.value.retry_after == expected
 
 
@@ -110,22 +105,8 @@ def test_retry_after_http_date_in_the_future(server):
     when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=90), usegmt=True)
     server.reply = problem("unavailable", 503, "later", Retry_After=when)
     with pytest.raises(UnavailableError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert 80 <= exc.value.retry_after <= 91
-
-
-def test_idempotency_key_in_use_is_retried_to_the_first_answer(server):
-    """#25: 409 `idempotency_key_in_use` is answered only while the first
-    request with that key runs; a retry gated on `.retryable` gets its answer."""
-    server.queue("POST", "/v1/resources", problem("idempotency_key_in_use", 409),
-                 Reply(status=201, body={"zedtoken": "zt-1"}))
-    client = WolfAccessClient(server.url, CRED)
-    try:
-        create(client)
-    except WolfAccessError as exc:
-        assert exc.retryable
-        result = create(client)
-    assert result.zedtoken == "zt-1"
 
 
 @pytest.mark.parametrize("name", ["x\ny", "a" * 10240, "Under_Review", "under-review",
@@ -136,7 +117,7 @@ def test_a_problem_name_that_is_not_a_plain_name_is_dropped(server, name):
     server.reply = Reply(status=400, content_type="application/problem+json",
                          body={"type": PROBLEM + name, "status": 400})
     with pytest.raises(ProblemError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert type(exc.value) is ProblemError and exc.value.name is None
     assert str(exc.value) == "wolf-access answered HTTP 400"
 
@@ -145,7 +126,7 @@ def test_a_64_character_name_is_kept(server):
     name = "a" * 64
     server.reply = problem(name, 409)
     with pytest.raises(ProblemError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert exc.value.name == name
 
 
@@ -154,7 +135,7 @@ def test_unknown_problem_name_is_a_problem_error_with_its_name(server):
     arrives typed as a `ProblemError` carrying the name."""
     server.reply = problem("under_review", 409, "an open review case freezes it")
     with pytest.raises(ProblemError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert type(exc.value) is ProblemError
     assert (exc.value.name, exc.value.status) == ("under_review", 409)
 
@@ -167,7 +148,7 @@ def test_unknown_problem_name_is_a_problem_error_with_its_name(server):
 def test_a_problem_from_elsewhere_has_no_name(server, body):
     server.reply = Reply(status=404, body=body, content_type="application/problem+json")
     with pytest.raises(ProblemError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert type(exc.value) is ProblemError and exc.value.name is None
 
 
@@ -179,7 +160,7 @@ def test_a_problem_from_elsewhere_has_no_name(server, body):
 def test_a_body_that_is_not_a_problem_is_a_plain_http_error(server, reply):
     server.reply = reply
     with pytest.raises(WolfAccessHTTPError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert not isinstance(exc.value, ProblemError) and exc.value.status == 409
 
 
@@ -188,7 +169,7 @@ def test_problem_media_type_parameters_are_allowed(server):
     reply.content_type = "application/problem+json; charset=utf-8"
     server.reply = reply
     with pytest.raises(ConflictError):
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
 
 
 @pytest.mark.parametrize("field_name, value", [("title", 5), ("detail", ["x"])])
@@ -198,14 +179,14 @@ def test_non_string_problem_members_are_dropped(server, field_name, value):
     reply.body[field_name] = value
     server.reply = reply
     with pytest.raises(ConflictError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert getattr(exc.value, field_name) is None
 
 
 def test_server_text_and_credential_never_reach_str(server):
     server.reply = problem("conflict", 409, f"echo {CRED}")
     with pytest.raises(ConflictError) as exc:
-        create(WolfAccessClient(server.url, CRED))
+        create(make(server.url))
     assert CRED not in str(exc.value) and CRED not in repr(exc.value)
     assert str(exc.value) == "wolf-access answered HTTP 409 (conflict)"
 

@@ -4,16 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wolf-access-client"
-version = "0.6.0"
-description = "Python client library for wolf-access, the Nice-Wolf-Studio authorization service."
+version = "0.7.0"
+description = "Python client library for wolf-access, the Nice-Wolf-Studio authorization service, and the shared WRN library."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-# psycopg2-binary runs the Postgres reference store's tests (TEST_DATABASE_URL);
+# psycopg2-binary runs the SQL canonical_wrn conformance test (TEST_DATABASE_URL);
 # the library itself needs no driver.
 test = ["pytest>=8", "psycopg2-binary==2.9.13"]
+
+[project.scripts]
+# INT-B3: refuse WRN string literals outside wolf_access_client.wrn.
+wolf-access-wrn-lint = "wolf_access_client.wrn_lint:main"
 
 [project.urls]
 Source = "https://github.com/Nice-Wolf-Studio/wolf-access-client"
