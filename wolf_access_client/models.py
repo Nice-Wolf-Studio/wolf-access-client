@@ -1,24 +1,46 @@
-"""The values the client takes and returns. Arguments are plain frozen
-dataclasses; the client checks them when they are used, and nothing is sent
-when one is wrong (`ValueError`)."""
+"""The values the client takes and returns. Arguments are frozen dataclasses
+checked when they are made; a WRN argument may be a `Wrn` or its text, and
+text is parsed (`WrnError`) before anything is sent."""
 
 from __future__ import annotations
 
-from datetime import datetime
+import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from datetime import datetime
+from typing import Any, Sequence
 
-from ._checks import PRINCIPAL_TYPES, nonblank, resource_type
+from .wrn import Wrn, parse_wrn
 
+
+def as_wrn(value: Any, name: str = "wrn") -> Wrn:
+    """`value` as a `Wrn`: a `Wrn` as is, text parsed (`WrnError`)."""
+    if isinstance(value, Wrn):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a Wrn or its text")
+    return parse_wrn(value)
+
+
+def _nonblank(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _names(value: Any, what: str) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple, frozenset, set)) \
+            or not all(_nonblank(v) for v in value):
+        raise ValueError(f"{what} must be a list of non-empty names")
+    return tuple(sorted(value)) if isinstance(value, (set, frozenset)) else tuple(value)
+
+
+# --- decisions (AuthZEN, /access/v1) --------------------------------------------------
 
 @dataclass(frozen=True)
 class Decision:
     """An AuthZEN decision. A deny is `allowed=False`, a value, not an error.
 
-    `context` is a shallow copy of the response `context` (for example
-    `reason_user`; never a score, API-P2). In an `evaluations` batch, an item
-    wolf-access could not evaluate is a deny whose `error` says why, and an
-    item a short-circuit semantic skipped is `evaluated=False` (also a deny).
+    In an `evaluations` batch, an item wolf-access could not evaluate is a
+    deny whose `error` says why (`{status, message}`), and an item a
+    short-circuit semantic skipped is `evaluated=False` (also a deny).
     Equality compares every field; the hash uses `allowed` only."""
 
     allowed: bool
@@ -36,391 +58,171 @@ class Decision:
         return self.allowed
 
     @property
-    def signoff_required(self) -> bool:
-        """An allowed write through a client bound to an agent that needs the
-        delegating principal's sign-off before it commits (wolf-access
-        DEL-S1, CLI-D4 (ii)): hold it, `create_signoff`, and commit only
-        after `consume_signoff` succeeds."""
-        return self.allowed and self.context.get("signoff_required") is True
-
-    @property
     def error(self) -> dict[str, Any] | None:
         """`{status, message}` when wolf-access could not evaluate this batch
-        item (invalid, or another service's type); else None."""
+        item; else None."""
         error = self.context.get("error")
         return error if isinstance(error, dict) else None
 
 
 @dataclass(frozen=True)
 class EvaluationItem:
-    """One check in an `evaluations` batch."""
+    """One check in an `evaluations` batch: `action` (a permission,
+    `<service>.<type>.<verb>`) on `resource` (a WRN)."""
 
     action: str
-    resource_type: str
-    resource_id: str
+    resource: Wrn
 
+    def __post_init__(self) -> None:
+        if not _nonblank(self.action):
+            raise ValueError("action must be a non-empty permission name")
+        object.__setattr__(self, "resource", as_wrn(self.resource, "resource"))
+
+
+# --- the type registry (PUT /v1/services/{service}/schema) ----------------------------
 
 @dataclass(frozen=True)
-class ResourceRef:
-    """A resource: its registered type (`<service>/<type>`) and id."""
+class SchemaType:
+    """A type a service registers (AC-8, AC-9): `<service>.<type>`, whether
+    it gets resource rows (`registered`), and the types its parent may be
+    (`allowed_parents`, `<service>.<type>` names, wolf-access's own
+    `access.org` / `access.project` included)."""
 
     type: str
-    id: str
+    registered: bool = True
+    allowed_parents: Sequence[str] = ()
+
+    def __post_init__(self) -> None:
+        if not _nonblank(self.type):
+            raise ValueError("type must be '<service>.<type>'")
+        if not isinstance(self.registered, bool):
+            raise ValueError("registered must be True or False")
+        object.__setattr__(self, "allowed_parents",
+                           _names(self.allowed_parents, "allowed_parents"))
+
+    def wire(self) -> dict[str, Any]:
+        return {"type": self.type, "registered": self.registered,
+                "allowed_parents": list(self.allowed_parents)}
 
 
 @dataclass(frozen=True)
-class PrincipalRef:
-    """An owner (API-D3): `PrincipalRef.user(<gateway user_id>)`, or
-    `PrincipalRef("org" | "relationship" | "project" | "agent", <principal id>)`."""
-
-    type: str
-    id: str
-
-    @classmethod
-    def user(cls, user_id: str) -> "PrincipalRef":
-        return cls("user", user_id)
-
-
-@dataclass(frozen=True)
-class Permission:
-    """A permission a type registers, and the built-in roles that get it
-    (`Owner`, `Co-owner`, `Editor`, `Viewer`). The base permissions (`view`,
-    `edit`, `share`, ...) exist on every type and are not registered."""
+class SchemaPermission:
+    """A permission a service registers, `<service>.<type>.<verb>`; one with
+    `requires_end_to_end` is denied to an app without end-to-end encryption
+    (AC-19)."""
 
     name: str
-    default_roles: Sequence[str] = ()
+    requires_end_to_end: bool = False
+
+    def __post_init__(self) -> None:
+        if not _nonblank(self.name):
+            raise ValueError("name must be '<service>.<type>.<verb>'")
+        if not isinstance(self.requires_end_to_end, bool):
+            raise ValueError("requires_end_to_end must be True or False")
+
+    def wire(self) -> dict[str, Any]:
+        return {"name": self.name, "requires_end_to_end": self.requires_end_to_end}
 
 
 @dataclass(frozen=True)
-class Parent:
-    """A parent relation a type registers, and the service's own types that
-    may be the parent."""
+class SchemaRole:
+    """A role bundle (AC-9): its `rank` (a granter grants only at or below
+    their own, AC-5) and the permissions it holds. Adding a permission to an
+    existing role is an operator's: make that registration with an
+    operator's principal token."""
 
-    relation: str
-    parent_types: Sequence[str]
+    name: str
+    rank: int
+    permissions: Sequence[str] = ()
 
+    def __post_init__(self) -> None:
+        if not _nonblank(self.name):
+            raise ValueError("name must be a role name")
+        if isinstance(self.rank, bool) or not isinstance(self.rank, int):
+            raise ValueError("rank must be a whole number")
+        object.__setattr__(self, "permissions", _names(self.permissions, "permissions"))
+
+    def wire(self) -> dict[str, Any]:
+        return {"name": self.name, "rank": self.rank, "permissions": list(self.permissions)}
+
+
+# --- the tree (/v1/resources) ---------------------------------------------------------
 
 @dataclass(frozen=True)
 class Written:
-    """A write wolf-access has applied. The client keeps `zedtoken` and sends
-    it with the decisions that follow (CLI-D2). `zedtoken` is None when
-    wolf-access answered an empty one (it holds no watermark yet, #26): the
-    write happened, and the client keeps the token it already had."""
+    """A write wolf-access applied: its consistency token (a ZedToken, AC-6).
+    The client keeps it and sends it with the decisions that follow. None
+    when wolf-access answered an empty one: the write happened."""
 
     zedtoken: str | None = None
 
 
 @dataclass(frozen=True)
-class RequestFiled:
-    """A filed access request (REQ-D5): the stable `request` handle and the
-    requester's single-use `continue` token (REQ-D6), the same answer whether
-    or not the target exists. The token is a secret for the requester: hand
-    it to them, never log it (it is left out of `repr`)."""
+class Versioned:
+    """A create or move wolf-access applied: the resource's new `version`
+    (AC-6: every change raises it; pass it to the next move or delete) and
+    the write's consistency token."""
 
-    request: str
-    continue_token: str = field(repr=False)
-
-
-@dataclass(frozen=True)
-class SignoffFiled:
-    """A sign-off waiting for its signer (wolf-access CLI-D4 (ii)): commit the
-    held write only after `consume_signoff(signoff, diff_hash)` succeeds,
-    before `expires_at`."""
-
-    signoff: str
-    status: str
-    expires_at: datetime
+    version: int
+    zedtoken: str | None = None
 
 
 @dataclass(frozen=True)
-class Pending:
-    """HTTP 202: the write is committed but its relationships are not applied
-    yet (EVT-D3). Until they are, wolf-access fails every check closed."""
+class Resource:
+    """`GET /v1/resources/{wrn}`: where a registered resource sits, and the
+    `name` of a container wolf-access owns (an org or project; None for
+    anything else)."""
 
-    status: str = "pending"
-
-
-@dataclass(frozen=True)
-class Proposed:
-    """HTTP 202 to an AI topic level (WN-5, WN-D1): a loosening, or a level
-    above the scope's ceiling, that does not apply until the owner decides
-    `proposal` (wolfaccess_decide_topic_proposal, or an owner `set_topic_level`)."""
-
-    proposal: str
-    status: str = "proposed"
-
-
-#: The levels a topic can hold (WN-2). `needs_input` is never one (WN-6).
-TOPIC_LEVELS = ("readable", "hinted", "hidden")
-#: Who set a topic level: the service's classifier, or the owner answering it.
-TOPIC_SOURCES = ("ai", "owner")
-#: What a topic is about; people / money / health / legal default to hidden (WN-4).
-TOPIC_CATEGORIES = ("people", "money", "health", "legal", "other")
+    wrn: Wrn
+    parent_wrn: Wrn | None
+    name: str | None = None
 
 
 @dataclass(frozen=True)
-class Hint:
-    """One hint from a resource search (API-D5): a person and a topic only,
-    never a title, content, count or score (WN-8, WN-P2). `hint` is the
-    opaque handle a request may name (`request_access(hint=...)`, SCP-D2);
-    it is valid only for the person it was shown to."""
+class ReconcileChange:
+    """A move or removal reconcile found, waiting for an operator's approval
+    (AC-14). `parent_wrn` is where a move goes (None for a removal)."""
 
-    person: str
-    topic: str
-    hint: str
-
-
-@dataclass(frozen=True)
-class ResourceSearch:
-    """`search_resources_with_hints`: every page's resources, in order, and
-    the hints the pages carried. Never a total, never a score."""
-
-    resources: tuple["ResourceRef", ...]
-    hints: tuple[Hint, ...] = ()
-
-
-#: How an owner example came about (WN-D8): an owner's own level (`set`),
-#: or the owner's answer to an AI proposal (`approved` / `denied`).
-EXAMPLE_DECISIONS = ("set", "approved", "denied")
+    id: str
+    service: str
+    wrn: Wrn
+    kind: str
+    parent_wrn: Wrn | None
+    found_at: datetime
+    approved_by: str | None = None
+    approved_at: datetime | None = None
 
 
 @dataclass(frozen=True)
-class TopicExample:
-    """An owner answer wolf-access keeps as a classification example (WN-7,
-    WN-D8). `topic` is the topic resource's id (of type `topic_type`);
-    `level` is the level the owner set, approved or denied (`decision`): a
-    `denied` example's level is the one that did NOT take effect. `by` is
-    the answering person's gateway user_id (None when wolf-access has none)."""
+class Reconciled:
+    """`POST /v1/services/{service}/reconcile`: the WRNs added, and the
+    service's changes waiting for approval."""
 
-    topic: str
-    category: str
-    level: str
-    reason: str
-    decision: str
-    by: str | None
-    at: str
-    topic_type: str = ""
+    added: tuple[Wrn, ...]
+    changes: tuple[ReconcileChange, ...]
+    zedtoken: str | None = None
 
 
-# --- the lifecycle outbox (CUT-D1 (1), API-D10) ---------------------------------------
-
-#: The lifecycle actions a service writes to its outbox. `ack_ownership`
-#: (CUT-D1 (4)) is written by the library itself from wolf-access M1c-3 on.
-ACTIONS = ("create", "move", "private", "delete")
-#: A row's result from wolf-access. `resolved` is a refused row that
-#: reconcile has resolved; it counts as applied (CUT-D1 (1)).
-RESULTS = ("applied", "held", "refused", "resolved")
-#: A row in the outbox: not answered yet (`pending`), or its last result.
-ROW_STATUSES = ("pending",) + RESULTS
-
-
-def _ref(value: Any, name: str) -> "ResourceRef":
-    if not isinstance(value, ResourceRef):
-        raise ValueError(f"{name} must be a ResourceRef")
-    resource_type(value.type)
-    if not nonblank(value.id):
-        raise ValueError(f"{name}.id must be a non-empty string")
-    return value
-
-
-def _ref_wire(ref: "ResourceRef") -> dict[str, str]:
-    return {"type": ref.type, "id": ref.id}
-
-
-def _ref_from(value: Any, name: str) -> "ResourceRef":
-    if not isinstance(value, Mapping) or set(value) != {"type", "id"}:
-        raise ValueError(f"{name} must be {{type, id}}")
-    return _ref(ResourceRef(value["type"], value["id"]), name)
-
+# --- token exchange (POST /v1/token) --------------------------------------------------
 
 @dataclass(frozen=True)
-class Change:
-    """One resource lifecycle change, as the service commits it (CUT-D1 (1)).
-    Build it with `Change.create`, `Change.move`, `Change.set_private` or
-    `Change.delete`; it is checked when it is built, so a change wolf-access
-    could only refuse for its shape never reaches the outbox.
+class ExchangedToken:
+    """An RFC 8693 token wolf-access issued (AC-20): a JWT for one principal
+    (`sub`) to call one service (`aud`), at most 60 seconds. With audience
+    `access` it is the principal's token for wolf-access's own calls made for
+    a principal (`create_resource` under a parent, AC-3). A secret: it is
+    left out of `repr`; never log it. `expires_at` is `time.time()` when it
+    expires, by this machine's clock."""
 
-    - `create`: `owner` and `author` (the gateway `user_id` of the person
-      filing it) are required; `parent` (None: no parent) and `private` are
-      sent only when given.
-    - `move`: `parent` is the new parent; None moves it to the root.
-    - `private`: `private` is the new flag.
-    - `delete`: nothing else.
-
-    `intent` is the single-use token wolf-access grants for a move, `private`
-    change or delete (CUT-D1 (3), wolf-access M1c-2); creates need none."""
-
-    action: str
-    resource: ResourceRef
-    parent: ResourceRef | None = None
-    private: bool | None = None
-    owner: PrincipalRef | None = None
-    author: str | None = None
-    intent: str | None = None
+    access_token: str = field(repr=False)
+    expires_in: int
+    issued_token_type: str
+    token_type: str = "Bearer"
+    expires_at: float = field(default=0.0, compare=False)
 
     def __post_init__(self) -> None:
-        if self.action not in ACTIONS:
-            raise ValueError("action must be one of " + ", ".join(ACTIONS) + (
-                " (ack_ownership rows arrive with wolf-access M1c-3)"
-                if self.action == "ack_ownership" else ""))
-        _ref(self.resource, "resource")
-        if self.parent is not None:
-            if self.action not in ("create", "move"):
-                raise ValueError(f"a {self.action} change has no parent")
-            _ref(self.parent, "parent")
-        if self.private is not None and not isinstance(self.private, bool):
-            raise ValueError("private must be True or False")
-        if self.action == "private" and self.private is None:
-            raise ValueError("a private change names private: True or False")
-        if self.action in ("move", "delete") and self.private is not None:
-            raise ValueError(f"a {self.action} change has no private flag")
-        if self.action == "create":
-            owner = self.owner
-            if not isinstance(owner, PrincipalRef) or owner.type not in PRINCIPAL_TYPES \
-                    or not nonblank(owner.id):
-                raise ValueError("a create needs owner, a PrincipalRef of type " +
-                                 ", ".join(PRINCIPAL_TYPES))
-            if not nonblank(self.author):
-                raise ValueError("a create needs author, the gateway user_id of the person "
-                                 "filing it")
-            if self.intent is not None:
-                raise ValueError("a create needs no intent token (CUT-D1 (3))")
-        elif self.owner is not None or self.author is not None:
-            raise ValueError("only a create names an owner and an author (owner changes "
-                             "go through wolf-access, CUT-D1 (4))")
-        if self.intent is not None and not nonblank(self.intent):
-            raise ValueError("intent must be a non-empty string")
+        if not self.expires_at:
+            object.__setattr__(self, "expires_at", time.time() + self.expires_in)
 
-    @classmethod
-    def create(cls, resource: ResourceRef, *, owner: PrincipalRef, author: str,
-               parent: ResourceRef | None = None, private: bool | None = None) -> "Change":
-        return cls("create", resource, parent=parent, private=private, owner=owner,
-                   author=author)
-
-    @classmethod
-    def create_topic(cls, topic: ResourceRef, *, note: ResourceRef, owner: PrincipalRef,
-                     author: str) -> "Change":
-        """A topic child resource (WN-D3), created through the outbox under its
-        note (Q-T7): `owner` is the note's owner and `author` the note's author
-        (owner and author reach hidden topics through it). The topic id must
-        be opaque: no note id, no title (it is shown in hints)."""
-        if not isinstance(note, ResourceRef):
-            raise ValueError("a topic's note is a ResourceRef")
-        return cls.create(topic, owner=owner, author=author, parent=note)
-
-    @classmethod
-    def move(cls, resource: ResourceRef, *, parent: ResourceRef | None,
-             intent: str | None = None) -> "Change":
-        return cls("move", resource, parent=parent, intent=intent)
-
-    @classmethod
-    def set_private(cls, resource: ResourceRef, private: bool, *,
-                    intent: str | None = None) -> "Change":
-        return cls("private", resource, private=private, intent=intent)
-
-    @classmethod
-    def delete(cls, resource: ResourceRef, *, intent: str | None = None) -> "Change":
-        return cls("delete", resource, intent=intent)
-
-    def wire(self) -> dict[str, Any]:
-        """The row's fields as wolf-access takes them (API-D10 (a)), without
-        `sequence` and `change_id`."""
-        out: dict[str, Any] = {"action": self.action, "resource": _ref_wire(self.resource)}
-        if self.action == "create":
-            out["owner"] = {"type": self.owner.type, "id": self.owner.id}  # type: ignore[union-attr]
-            out["author"] = self.author
-            if self.parent is not None:
-                out["parent"] = _ref_wire(self.parent)
-        elif self.action == "move":
-            out["parent"] = None if self.parent is None else _ref_wire(self.parent)
-        if self.private is not None:
-            out["private"] = self.private
-        if self.intent is not None:
-            out["intent"] = self.intent
-        return out
-
-    @classmethod
-    def from_wire(cls, data: Mapping[str, Any]) -> "Change":
-        """The `Change` a stored row holds (the inverse of `wire`)."""
-        if not isinstance(data, Mapping):
-            raise ValueError("a row is an object")
-        known = {"sequence", "change_id", "action", "resource", "parent", "private", "owner",
-                 "author", "intent"}
-        if set(data) - known:
-            raise ValueError("a row has unknown fields: " + ", ".join(sorted(set(data) - known)))
-        owner = data.get("owner")
-        if owner is not None:
-            if not isinstance(owner, Mapping) or set(owner) != {"type", "id"}:
-                raise ValueError("owner must be {type, id}")
-            owner = PrincipalRef(owner["type"], owner["id"])
-        parent = data.get("parent")
-        return cls(data.get("action"), _ref_from(data.get("resource"), "resource"),  # type: ignore[arg-type]
-                   parent=None if parent is None else _ref_from(parent, "parent"),
-                   private=data.get("private"), owner=owner, author=data.get("author"),
-                   intent=data.get("intent"))
-
-
-@dataclass(frozen=True)
-class OutboxRow:
-    """A change in the outbox: its place in the service's gapless sequence,
-    its change id, and its last result from wolf-access (`pending` until
-    it has one; `reason` says why a row is held or refused)."""
-
-    sequence: int
-    change_id: str
-    change: Change
-    status: str = "pending"
-    reason: str | None = None
-
-    def __post_init__(self) -> None:
-        if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) \
-                or self.sequence < 1:
-            raise ValueError("sequence must be a positive integer")
-        if not nonblank(self.change_id):
-            raise ValueError("change_id must be a non-empty string")
-        if not isinstance(self.change, Change):
-            raise ValueError("change must be a Change")
-        if self.status not in ROW_STATUSES:
-            raise ValueError("status must be one of " + ", ".join(ROW_STATUSES))
-
-    @property
-    def resource(self) -> ResourceRef:
-        return self.change.resource
-
-    def wire(self) -> dict[str, Any]:
-        """The row as `POST /v1/services/{service}/changes` takes it."""
-        return {"sequence": self.sequence, "change_id": self.change_id, **self.change.wire()}
-
-
-@dataclass(frozen=True)
-class ChangeResult:
-    """wolf-access's answer for one row: `applied`, `held` (waiting in
-    sequence, or for the seed import), `refused` (dead-lettered), or
-    `resolved` (a refused row reconcile resolved). `reason` is wolf-access's
-    explanation for a held or refused row."""
-
-    sequence: int
-    status: str
-    reason: str | None = None
-
-
-@dataclass(frozen=True)
-class ChangesAnswer:
-    """An answer of `POST` or `GET /v1/services/{service}/changes`: one result
-    per row, and `applied_through`, the sequence number up to which wolf-access
-    has applied every row."""
-
-    results: tuple[ChangeResult, ...]
-    applied_through: int
-
-
-@dataclass(frozen=True)
-class OutboxProgress:
-    """Where a service's outbox stands: the newest row written
-    (`last_sequence`, 0 for none), the row up to which wolf-access has applied
-    every row (`applied_through`), and the refused row at the head of the
-    sequence, if one is dead-lettered (`dead_letter`)."""
-
-    last_sequence: int
-    applied_through: int
-    dead_letter: OutboxRow | None = None
+    def __str__(self) -> str:
+        return f"ExchangedToken(expires_in={self.expires_in})"

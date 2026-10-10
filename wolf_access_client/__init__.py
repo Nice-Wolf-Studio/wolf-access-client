@@ -1,7 +1,12 @@
 """Python client library for wolf-access, the Nice-Wolf-Studio authorization
-service. See README.md."""
+service, and the shared WRN library (INT-B3). See README.md."""
 
-from .client import SEMANTICS, WolfAccessClient
+from .client import (
+    ACCESS_AUDIENCE,
+    MAX_EVALUATIONS,
+    SEMANTICS,
+    WolfAccessClient,
+)
 from .errors import (
     PROBLEM_TYPES,
     AccessUnavailable,
@@ -9,75 +14,58 @@ from .errors import (
     ConflictError,
     DecisionRefused,
     ForbiddenError,
-    HttpsRequiredError,
-    IdempotencyKeyInUseError,
-    IdempotencyKeyReusedError,
     NotFoundError,
-    OwnerRequiredError,
-    OwnershipMismatchError,
     ProblemError,
-    RateLimitedError,
-    SeedNotVerified,
+    TokenExchangeError,
     UnauthorizedError,
     UnavailableError,
-    UseOutboxError,
     WolfAccessError,
     WolfAccessHTTPError,
     WolfAccessResponseError,
     WolfAccessUnavailable,
 )
-from .mode import AccessGate, AccessMode, GateHealth
+from .jcs import canonical_json, diff_hash
 from .models import (
-    Change,
-    ChangeResult,
-    ChangesAnswer,
     Decision,
     EvaluationItem,
-    OutboxProgress,
-    OutboxRow,
-    Parent,
-    TOPIC_CATEGORIES,
-    TOPIC_LEVELS,
-    TOPIC_SOURCES,
-    Hint,
-    Pending,
-    Permission,
-    PrincipalRef,
-    Proposed,
-    RequestFiled,
-    ResourceRef,
-    SignoffFiled,
-    ResourceSearch,
-    TopicExample,
+    ExchangedToken,
+    ReconcileChange,
+    Reconciled,
+    Resource,
+    SchemaPermission,
+    SchemaRole,
+    SchemaType,
+    Versioned,
     Written,
 )
-from .jcs import canonical_json, diff_hash
-from .outbox import OutboxStore, PostgresOutboxStore, SQLiteOutboxStore
-from .relay import OutboxRelay, RelayState
+from .wrn import (
+    ACCESS_KINDS,
+    CANONICAL_WRN_SQL,
+    PRINCIPAL_KINDS,
+    Wrn,
+    WrnError,
+    is_canonical_wrn,
+    parse_wrn,
+)
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
-    # client and values
-    "WolfAccessClient", "Decision", "EvaluationItem", "SEMANTICS", "ResourceRef",
-    "PrincipalRef", "RequestFiled", "Permission", "Parent", "Written", "Pending",
-    # sign-off of delegate / agent writes (CLI-D4 (ii), CLI-P6)
-    "SignoffFiled", "canonical_json", "diff_hash",
-    # topics and hints (WN-D3, API-D5)
-    "Proposed", "Hint", "ResourceSearch", "TopicExample", "TOPIC_LEVELS", "TOPIC_SOURCES",
-    "TOPIC_CATEGORIES",
-    # enforcement mode (CUT-D1)
-    "AccessMode", "AccessGate", "GateHealth",
-    # cut-over: lifecycle outbox and relay (CUT-D1 (1), API-D10)
-    "Change", "OutboxRow", "ChangeResult", "ChangesAnswer", "OutboxProgress", "OutboxStore",
-    "SQLiteOutboxStore", "PostgresOutboxStore", "OutboxRelay", "RelayState",
+    # WRNs (INT-B3)
+    "Wrn", "WrnError", "parse_wrn", "is_canonical_wrn", "CANONICAL_WRN_SQL",
+    "ACCESS_KINDS", "PRINCIPAL_KINDS",
+    # client
+    "WolfAccessClient", "ACCESS_AUDIENCE", "SEMANTICS", "MAX_EVALUATIONS",
+    # values
+    "Decision", "EvaluationItem", "SchemaType", "SchemaPermission", "SchemaRole",
+    "Written", "Versioned", "Resource", "ReconcileChange", "Reconciled", "ExchangedToken",
+    # canonical JSON
+    "canonical_json", "diff_hash",
     # errors
     "WolfAccessError", "AccessUnavailable", "WolfAccessUnavailable",
-    "WolfAccessResponseError", "WolfAccessHTTPError", "DecisionRefused", "ProblemError",
-    "PROBLEM_TYPES", "OwnerRequiredError", "OwnershipMismatchError", "ConflictError",
-    "ForbiddenError", "NotFoundError", "BadRequestError", "UnauthorizedError",
-    "HttpsRequiredError", "RateLimitedError", "UnavailableError",
-    "IdempotencyKeyReusedError", "IdempotencyKeyInUseError", "UseOutboxError",
-    "SeedNotVerified",
+    "WolfAccessResponseError", "WolfAccessHTTPError", "DecisionRefused",
+    "TokenExchangeError", "ProblemError", "PROBLEM_TYPES", "BadRequestError",
+    "UnauthorizedError", "ForbiddenError", "NotFoundError", "ConflictError",
+    "UnavailableError",
     "__version__",
 ]

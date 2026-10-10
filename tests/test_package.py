@@ -70,27 +70,22 @@ def test_package_ships_a_py_typed_marker():
 
 
 PUBLIC_API = {
-    # client and results
-    "WolfAccessClient", "Decision", "EvaluationItem", "SEMANTICS", "ResourceRef",
-    "PrincipalRef", "RequestFiled", "Permission", "Parent", "Written", "Pending",
-    # sign-off of delegate / agent writes (CLI-D4 (ii), CLI-P6)
-    "SignoffFiled", "canonical_json", "diff_hash",
-    # topics and hints (WN-D3, API-D5)
-    "Proposed", "Hint", "ResourceSearch", "TopicExample", "TOPIC_LEVELS", "TOPIC_SOURCES",
-    "TOPIC_CATEGORIES",
-    # enforcement mode (CUT-D1)
-    "AccessMode", "AccessGate", "GateHealth",
-    # cut-over: lifecycle outbox and relay (CUT-D1 (1), API-D10)
-    "Change", "OutboxRow", "ChangeResult", "ChangesAnswer", "OutboxProgress", "OutboxStore",
-    "SQLiteOutboxStore", "PostgresOutboxStore", "OutboxRelay", "RelayState",
+    # WRNs (INT-B3)
+    "Wrn", "WrnError", "parse_wrn", "is_canonical_wrn", "CANONICAL_WRN_SQL",
+    "ACCESS_KINDS", "PRINCIPAL_KINDS",
+    # client
+    "WolfAccessClient", "ACCESS_AUDIENCE", "SEMANTICS", "MAX_EVALUATIONS",
+    # values
+    "Decision", "EvaluationItem", "SchemaType", "SchemaPermission", "SchemaRole",
+    "Written", "Versioned", "Resource", "ReconcileChange", "Reconciled", "ExchangedToken",
+    # canonical JSON
+    "canonical_json", "diff_hash",
     # errors
     "WolfAccessError", "AccessUnavailable", "WolfAccessUnavailable",
-    "WolfAccessResponseError", "WolfAccessHTTPError", "DecisionRefused", "ProblemError",
-    "PROBLEM_TYPES", "OwnerRequiredError", "OwnershipMismatchError", "ConflictError",
-    "ForbiddenError", "NotFoundError", "BadRequestError", "UnauthorizedError",
-    "HttpsRequiredError", "RateLimitedError", "UnavailableError",
-    "IdempotencyKeyReusedError", "IdempotencyKeyInUseError", "UseOutboxError",
-    "SeedNotVerified",
+    "WolfAccessResponseError", "WolfAccessHTTPError", "DecisionRefused",
+    "TokenExchangeError", "ProblemError", "PROBLEM_TYPES", "BadRequestError",
+    "UnauthorizedError", "ForbiddenError", "NotFoundError", "ConflictError",
+    "UnavailableError",
     "__version__",
 }
 
@@ -99,3 +94,20 @@ def test_public_api_is_exported():
     assert set(wolf_access_client.__all__) == PUBLIC_API
     for name in PUBLIC_API:
         assert hasattr(wolf_access_client, name), name
+
+
+def test_the_wrn_lint_console_script_is_registered():
+    """INT-B3: consumers run `wolf-access-wrn-lint` in CI."""
+    from importlib.metadata import entry_points
+    (script,) = [e for e in entry_points(group="console_scripts")
+                 if e.name == "wolf-access-wrn-lint"]
+    assert script.value == "wolf_access_client.wrn_lint:main"
+
+
+def test_the_old_api_modules_are_gone():
+    """0.7.0 removes the calls to routes wolf-access PR #329 removed, and the
+    cut-over outbox, relay and gate built on them (README, Changes from 0.6.0)."""
+    import importlib
+    for name in ("outbox", "relay", "mode"):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(f"wolf_access_client.{name}")

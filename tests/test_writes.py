@@ -1,30 +1,37 @@
-"""The service write API, `/v1` (API-D3): register a type, create, update and
-delete a resource. A write answers `Written(zedtoken)` (the client then
-carries that token, CLI-D2) or `Pending` (202, EVT-D3); a refusal is a typed
-RFC 9457 problem; a 503 with `Retry-After` is retryable."""
+"""The service calls on `/v1` (wolf-access `api.py`, `core.py` on
+`development` @ ffe20ed): the type registry (`PUT
+/v1/services/{service}/schema`, AC-9), the tree (`POST /v1/resources`,
+`GET`/`PATCH`/`DELETE /v1/resources/{wrn}`, AC-1, AC-3, AC-6, AC-7) and
+reconcile (`POST /v1/services/{service}/reconcile`, AC-14). Each answer is
+checked; a refusal is a typed RFC 9457 problem."""
+from datetime import datetime, timezone
+
 import pytest
 
 from tests.fake_server import FakeWolfAccess, Reply, problem
+from tests.helpers import CRED, LIST, ORG, TASK, TASK2, make
 from wolf_access_client import (
-    AccessUnavailable,
     ConflictError,
-    OwnerRequiredError,
-    Parent,
-    Pending,
-    Permission,
-    PrincipalRef,
-    ProblemError,
-    ResourceRef,
+    ExchangedToken,
+    ForbiddenError,
+    NotFoundError,
+    ReconcileChange,
+    Reconciled,
+    Resource,
+    SchemaPermission,
+    SchemaRole,
+    SchemaType,
+    UnauthorizedError,
     UnavailableError,
-    WolfAccessClient,
-    WolfAccessHTTPError,
+    Versioned,
     WolfAccessResponseError,
-    WolfAccessUnavailable,
     Written,
+    Wrn,
+    WrnError,
 )
 
-CRED = "svc-credential-not-a-secret"
-OWNER = PrincipalRef.user("user-1")
+JSON = "application/json, application/problem+json"
+PRINCIPAL_JWT = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ4In0.c2ln"
 
 
 @pytest.fixture
@@ -33,334 +40,313 @@ def server():
         yield fake
 
 
-def written(token="zt-1", status=200):
-    return Reply(status=status, body={"zedtoken": token})
+def resource_path(w: Wrn) -> str:
+    return f"/v1/resources/{w}"
 
 
-PENDING = Reply(status=202, body={"status": "pending"})
+# --- PUT /v1/services/{service}/schema ------------------------------------------------
+
+TYPES = [SchemaType("tasks.list", allowed_parents=["access.org", "tasks.list"]),
+         SchemaType("tasks.task", allowed_parents=("tasks.list",)),
+         SchemaType("tasks.comment", registered=False, allowed_parents=["tasks.task"])]
+PERMISSIONS = [SchemaPermission("tasks.task.read"),
+               SchemaPermission("tasks.task.secret", requires_end_to_end=True)]
+ROLES = [SchemaRole("viewer", 10, ["tasks.task.read"])]
 
 
-def register(client, **overrides):
-    args = dict(permissions=[Permission("comment", ["Editor", "Viewer"]),
-                             Permission("export")],
-                parents=[Parent("folder", ["wolfnotes/folder"])], topics=True)
-    args.update(overrides)
-    return client.register_type("wolfnotes/note", **args)
-
-
-def create(client, **overrides):
-    args = dict(owner=OWNER, author="user-1")
-    args.update(overrides)
-    return client.create_resource("wolfnotes/note", "n-1", **args)
-
-
-# --- PUT /v1/types/{service}/{type} -------------------------------------------------
-
-def test_register_type_request_shape(server):
-    server.reply = written("zt-type")
-    result = register(WolfAccessClient(server.url, CRED))
+def test_register_schema_request_shape(server):
+    server.reply = Reply(body={"zedtoken": "zt-schema"})
+    client = make(server.url)
+    assert client.register_schema(types=TYPES, permissions=PERMISSIONS, roles=ROLES) \
+        == Written("zt-schema")
     (seen,) = server.requests
-    assert (seen.method, seen.path) == ("PUT", "/v1/types/wolfnotes/note")
-    assert seen.body == {
-        "permissions": [{"name": "comment", "default_roles": ["Editor", "Viewer"]},
-                        {"name": "export", "default_roles": []}],
-        "parents": [{"relation": "folder", "parent_types": ["wolfnotes/folder"]}],
-        "topics": True,
-    }
+    assert (seen.method, seen.path) == ("PUT", "/v1/services/tasks/schema")
     assert seen.headers["authorization"] == f"Bearer {CRED}"
-    assert seen.headers["content-type"] == "application/json"
-    assert result == Written("zt-type")
+    assert seen.headers["accept"] == JSON
+    assert seen.body == {
+        "types": [
+            {"type": "tasks.list", "registered": True,
+             "allowed_parents": ["access.org", "tasks.list"]},
+            {"type": "tasks.task", "registered": True, "allowed_parents": ["tasks.list"]},
+            {"type": "tasks.comment", "registered": False, "allowed_parents": ["tasks.task"]}],
+        "permissions": [{"name": "tasks.task.read", "requires_end_to_end": False},
+                        {"name": "tasks.task.secret", "requires_end_to_end": True}],
+        "roles": [{"name": "viewer", "rank": 10, "permissions": ["tasks.task.read"]}]}
+    assert client.zedtoken == "zt-schema"
 
 
-def test_register_type_defaults(server):
-    server.reply = written()
-    WolfAccessClient(server.url, CRED).register_type("wolfnotes/note",
-                                                     permissions=[Permission("comment")])
-    assert server.requests[0].body == {
-        "permissions": [{"name": "comment", "default_roles": []}], "parents": [],
-        "topics": False}
+def test_register_schema_with_an_operators_token(server):
+    """AC-9: adding a permission to an existing role is made with an
+    operator's principal token instead of the service credential."""
+    server.reply = Reply(body={"zedtoken": "zt"})
+    make(server.url).register_schema(roles=ROLES, principal_token=PRINCIPAL_JWT)
+    assert server.requests[0].headers["authorization"] == f"Bearer {PRINCIPAL_JWT}"
+    assert server.requests[0].body == {"types": [], "permissions": [], "roles": [
+        {"name": "viewer", "rank": 10, "permissions": ["tasks.task.read"]}]}
 
 
-def test_register_type_pending_is_a_pending_result(server):
-    server.reply = PENDING
-    client = WolfAccessClient(server.url, CRED)
-    assert register(client) == Pending()
-    assert client.zedtoken is None
+@pytest.mark.parametrize("name, status, cls", [
+    ("forbidden", 403, ForbiddenError), ("conflict", 409, ConflictError),
+    ("unavailable", 503, UnavailableError)])
+def test_register_schema_refusals_are_typed(server, name, status, cls):
+    server.reply = problem(name, status)
+    with pytest.raises(cls):
+        make(server.url).register_schema(types=TYPES)
 
 
-def test_register_type_503_is_retryable_and_stores_nothing(server):
-    """A schema change while SpiceDB is unreachable: nothing stored, 503
-    `unavailable` with `Retry-After` (API-D3)."""
-    server.reply = problem("unavailable", 503, "SpiceDB is unreachable", Retry_After="5")
-    client = WolfAccessClient(server.url, CRED)
-    with pytest.raises(UnavailableError) as exc:
-        register(client)
-    assert exc.value.retryable is True and exc.value.retry_after == 5.0
-    assert exc.value.status == 503 and exc.value.name == "unavailable"
-    assert isinstance(exc.value, ProblemError) and not isinstance(exc.value, AccessUnavailable)
-    assert client.zedtoken is None
-
-
-@pytest.mark.parametrize("resource_type", ["wolfnotes", "wolfnotes/note/x", "/note",
-                                           "wolfnotes/", "", None, "a b/c"])
-def test_resource_type_is_service_slash_name(server, resource_type):
+@pytest.mark.parametrize("kwargs", [
+    {"types": "tasks.task"}, {"types": [{"type": "tasks.task"}]},
+    {"permissions": ["tasks.task.read"]}, {"roles": [("viewer", 10)]},
+    {"principal_token": "has space"}])
+def test_register_schema_checks_its_arguments(server, kwargs):
     with pytest.raises(ValueError):
-        WolfAccessClient(server.url, CRED).register_type(resource_type,
-                                                         permissions=[Permission("comment")])
-    with pytest.raises(ValueError):
-        WolfAccessClient(server.url, CRED).delete_resource(resource_type, "n-1")
+        make(server.url).register_schema(**kwargs)
     assert server.requests == []
 
 
-@pytest.mark.parametrize("overrides", [
-    {"permissions": [{"name": "comment", "default_roles": []}]},
-    {"permissions": "comment"},
-    {"permissions": [Permission("")]},
-    {"permissions": [Permission("comment", "Viewer")]},
-    {"permissions": [Permission("comment", [""])]},
-    {"parents": [("folder", ["wolfnotes/folder"])]},
-    {"parents": [Parent("", ["wolfnotes/folder"])]},
-    {"parents": [Parent("folder", [])]},
-    {"parents": [Parent("folder", "wolfnotes/folder")]},
-    {"topics": "yes"},
-    {"topics": None},
-])
-def test_register_type_arguments_are_checked(server, overrides):
+@pytest.mark.parametrize("make_value", [
+    lambda: SchemaType(""), lambda: SchemaType("tasks.task", registered="yes"),
+    lambda: SchemaType("tasks.task", allowed_parents="tasks.list"),
+    lambda: SchemaPermission(" "), lambda: SchemaPermission("p", requires_end_to_end=1),
+    lambda: SchemaRole("viewer", "10"), lambda: SchemaRole("viewer", True),
+    lambda: SchemaRole("", 1), lambda: SchemaRole("viewer", 1, ["", "x"])])
+def test_schema_values_are_checked_when_made(make_value):
     with pytest.raises(ValueError):
-        register(WolfAccessClient(server.url, CRED), **overrides)
-    assert server.requests == []
+        make_value()
 
 
 # --- POST /v1/resources ---------------------------------------------------------------
 
-def test_create_resource_request_shape(server):
-    server.reply = written("zt-c", status=201)
-    client = WolfAccessClient(server.url, CRED)
-    assert create(client) == Written("zt-c")
+def test_create_a_root(server):
+    """AC-1: an org is a root; the service credential creates it."""
+    server.reply = Reply(status=201, body={"zedtoken": "zt-1", "version": 7})
+    client = make(server.url)
+    assert client.create_resource(ORG, name="Home") == Versioned(7, "zt-1")
     (seen,) = server.requests
     assert (seen.method, seen.path) == ("POST", "/v1/resources")
-    assert seen.body == {"type": "wolfnotes/note", "id": "n-1",
-                         "owner": {"type": "user", "id": "user-1"}, "author": "user-1"}
-    assert "idempotency-key" not in seen.headers
-    assert client.zedtoken == "zt-c"
+    assert seen.body == {"wrn": str(ORG), "parent_wrn": None, "name": "Home"}
+    assert seen.headers["authorization"] == f"Bearer {CRED}"
+    assert client.zedtoken == "zt-1"
 
 
-def test_create_resource_with_parent_and_private(server):
-    server.reply = written(status=201)
-    create(WolfAccessClient(server.url, CRED),
-           owner=PrincipalRef("org", "6f1c0e1a-0000-4000-8000-000000000001"),
-           parent=ResourceRef("wolfnotes/folder", "f-1"), private=True)
-    assert server.requests[0].body == {
-        "type": "wolfnotes/note", "id": "n-1",
-        "owner": {"type": "org", "id": "6f1c0e1a-0000-4000-8000-000000000001"},
-        "author": "user-1", "parent": {"type": "wolfnotes/folder", "id": "f-1"},
-        "private": True}
-
-
-def test_create_resource_private_false_is_sent(server):
-    server.reply = written(status=201)
-    create(WolfAccessClient(server.url, CRED), private=False)
-    assert server.requests[0].body["private"] is False
-
-
-def test_idempotency_key_is_sent_as_a_header(server):
-    server.reply = written(status=201)
-    create(WolfAccessClient(server.url, CRED), idempotency_key="create-n-1-attempt")
-    assert server.requests[0].headers["idempotency-key"] == "create-n-1-attempt"
-
-
-@pytest.mark.parametrize("key", ["", " ", "a\r\nX-Evil: 1", "tab\tkey", "café", 5,
-                                 b"key", " lead", "trail "])
-def test_idempotency_key_must_be_a_printable_ascii_string(server, key):
-    with pytest.raises(ValueError):
-        create(WolfAccessClient(server.url, CRED), idempotency_key=key)
-    assert server.requests == []
-
-
-def test_create_resource_pending(server):
-    server.reply = PENDING
-    client = WolfAccessClient(server.url, CRED)
-    assert create(client) == Pending()
-    assert client.zedtoken is None
-
-
-@pytest.mark.parametrize("overrides", [
-    {"owner": None}, {"owner": "user-1"}, {"owner": {"type": "user", "id": "user-1"}},
-    {"owner": PrincipalRef("team", "x")}, {"owner": PrincipalRef("user", "")},
-    {"author": None}, {"author": ""}, {"author": 5},
-    {"parent": ("wolfnotes/folder", "f-1")}, {"parent": ResourceRef("wolfnotes/folder", "")},
-    {"private": "true"}, {"private": 1},
-])
-def test_create_resource_arguments_are_checked(server, overrides):
-    with pytest.raises(ValueError):
-        create(WolfAccessClient(server.url, CRED), **overrides)
-    assert server.requests == []
-
-
-@pytest.mark.parametrize("resource_id", ["", None, 5])
-def test_resource_id_is_a_non_empty_string(server, resource_id):
-    client = WolfAccessClient(server.url, CRED)
-    with pytest.raises(ValueError):
-        client.create_resource("wolfnotes/note", resource_id, owner=OWNER, author="user-1")
-    with pytest.raises(ValueError):
-        client.update_resource("wolfnotes/note", resource_id, private=False)
-    with pytest.raises(ValueError):
-        client.delete_resource("wolfnotes/note", resource_id)
-    assert server.requests == []
-
-
-def test_owner_required_is_typed(server):
-    server.reply = problem("owner_required", 422, "a resource needs an owner (OWN-3)")
-    with pytest.raises(OwnerRequiredError) as exc:
-        create(WolfAccessClient(server.url, CRED))
-    assert exc.value.detail == "a resource needs an owner (OWN-3)"
-    assert exc.value.retryable is False
-
-
-def test_re_creating_a_deleted_id_is_a_conflict(server):
-    """DELETE leaves a tombstone; a re-POST of that id is 409 `conflict`."""
-    server.queue("DELETE", "/v1/resources/wolfnotes/note/n-1", written("zt-d"))
-    server.queue("POST", "/v1/resources", problem("conflict", 409, "this resource already exists"))
-    client = WolfAccessClient(server.url, CRED)
-    assert client.delete_resource("wolfnotes/note", "n-1") == Written("zt-d")
-    with pytest.raises(ConflictError):
-        create(client)
-    assert client.zedtoken == "zt-d"
-
-
-# --- PATCH / DELETE /v1/resources/{type}/{id} ----------------------------------------
-
-@pytest.mark.parametrize("kwargs, body", [
-    ({"parent": ResourceRef("wolfnotes/folder", "f-2")},
-     {"parent": {"type": "wolfnotes/folder", "id": "f-2"}}),
-    ({"parent": None}, {"parent": None}),
-    ({"private": True}, {"private": True}),
-    ({"private": False, "parent": None}, {"private": False, "parent": None}),
-])
-def test_update_resource_sends_only_the_fields_given(server, kwargs, body):
-    server.reply = written("zt-u")
-    client = WolfAccessClient(server.url, CRED)
-    assert client.update_resource("wolfnotes/note", "n-1", **kwargs) == Written("zt-u")
+def test_create_under_a_parent_with_the_principals_token(server):
+    """AC-3: the create is checked against the principal named in the
+    caller's token: the exchanged token goes in Authorization."""
+    server.reply = Reply(status=201, body={"zedtoken": "zt-2", "version": 8})
+    token = ExchangedToken(PRINCIPAL_JWT, 60, "urn:ietf:params:oauth:token-type:jwt")
+    result = make(server.url).create_resource(str(TASK), LIST, principal_token=token)
+    assert result == Versioned(8, "zt-2")
     (seen,) = server.requests
-    assert (seen.method, seen.path) == ("PATCH", "/v1/resources/wolfnotes/note/n-1")
-    assert seen.body == body
-    assert client.zedtoken == "zt-u"
+    assert seen.body == {"wrn": str(TASK), "parent_wrn": str(LIST)}
+    assert seen.headers["authorization"] == f"Bearer {PRINCIPAL_JWT}"
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"private": None}, {"private": "no"},
-                                    {"parent": ("wolfnotes/folder", "f-1")}])
-def test_update_resource_needs_a_valid_parent_or_private(server, kwargs):
-    with pytest.raises(ValueError):
-        WolfAccessClient(server.url, CRED).update_resource("wolfnotes/note", "n-1", **kwargs)
-    assert server.requests == []
+def test_create_takes_the_token_text_too(server):
+    server.reply = Reply(status=201, body={"zedtoken": "zt", "version": 1})
+    make(server.url).create_resource(TASK, LIST, principal_token=PRINCIPAL_JWT)
+    assert server.requests[0].headers["authorization"] == f"Bearer {PRINCIPAL_JWT}"
 
 
-def test_update_resource_cannot_change_the_owner(server):
-    """Owner changes go through OWN-5 / OWN-D4, never PATCH (API-D3)."""
-    with pytest.raises(TypeError):
-        WolfAccessClient(server.url, CRED).update_resource("wolfnotes/note", "n-1",
-                                                           owner=OWNER)
-    assert server.requests == []
+@pytest.mark.parametrize("name, status, cls", [
+    ("not_found", 404, NotFoundError),          # a refused create looks like a missing parent
+    ("conflict", 409, ConflictError),           # the WRN exists
+    ("unauthorized", 401, UnauthorizedError),   # under a parent without a principal's token
+    ("forbidden", 403, ForbiddenError)])        # another service's resource
+def test_create_refusals_are_typed(server, name, status, cls):
+    server.reply = problem(name, status)
+    with pytest.raises(cls):
+        make(server.url).create_resource(TASK, LIST, principal_token=PRINCIPAL_JWT)
 
 
-def test_delete_resource_request_shape(server):
-    server.reply = written("zt-del")
-    client = WolfAccessClient(server.url, CRED)
-    assert client.delete_resource("wolfnotes/note", "n-1") == Written("zt-del")
-    (seen,) = server.requests
-    assert (seen.method, seen.path, seen.body) == (
-        "DELETE", "/v1/resources/wolfnotes/note/n-1", None)
-    assert seen.headers.get("content-length", "0") == "0"
-
-
-def test_resource_id_is_percent_encoded_in_the_path(server):
-    server.reply = written()
-    client = WolfAccessClient(server.url, CRED)
-    client.delete_resource("wolfnotes/note", "a/b c?d#e%f")
-    client.update_resource("wolfnotes/note", "a/b c?d#e%f", private=False)
-    assert [r.path for r in server.requests] == [
-        "/v1/resources/wolfnotes/note/a%2Fb%20c%3Fd%23e%25f"] * 2
-
-
-def test_update_and_delete_pending(server):
-    server.reply = PENDING
-    client = WolfAccessClient(server.url, CRED)
-    assert client.update_resource("wolfnotes/note", "n-1", private=False) == Pending()
-    assert client.delete_resource("wolfnotes/note", "n-1") == Pending()
-
-
-# --- ZedToken carried to the next decision (CLI-D2) ----------------------------------
-
-def test_a_write_s_zedtoken_is_sent_with_the_next_decision(server):
-    server.queue("POST", "/v1/resources", written("zt-after-create", status=201))
-    server.queue("POST", "/access/v1/evaluation", Reply(body={"decision": True}))
-    client = WolfAccessClient(server.url, CRED)
-    create(client)
-    client.evaluation(user_id="user-1", client_id="client-1", action="view",
-                      resource_type="wolfnotes/note", resource_id="n-1")
-    assert server.requests[1].body["context"] == {"client_id": "client-1",
-                                                  "zedtoken": "zt-after-create"}
-
-
-# --- malformed and failed writes -----------------------------------------------------
-
-@pytest.mark.parametrize("reply", [
-    Reply(status=200, body={}),
-    Reply(status=200, body={"zedtoken": None}),
-    Reply(status=201, body={"zedtoken": 5}),
-    Reply(status=200, body=[]),
-    Reply(status=200, raw=b"not json"),
-    Reply(status=202, body={"status": "done"}),
-    Reply(status=202, body={}),
-    Reply(status=204, raw=b""),
-    Reply(status=206, body={"zedtoken": "zt"}),
-])
-def test_malformed_write_answer_is_a_response_error(server, reply):
-    server.reply = reply
-    client = WolfAccessClient(server.url, CRED)
+@pytest.mark.parametrize("body", [
+    {"zedtoken": "zt"}, {"version": 1}, {"zedtoken": 5, "version": 1},
+    {"zedtoken": "zt", "version": 0}, {"zedtoken": "zt", "version": "1"},
+    {"zedtoken": "zt", "version": True}])
+def test_a_malformed_create_answer_is_a_response_error(server, body):
+    server.reply = Reply(status=201, body=body)
     with pytest.raises(WolfAccessResponseError):
-        create(client)
-    assert client.zedtoken is None
+        make(server.url).create_resource(ORG, name="Home")
 
 
-@pytest.mark.parametrize("status", [200, 201])
-def test_an_empty_zedtoken_is_written_with_no_token(server, status):
-    """wolf-access answers `{"zedtoken": ""}` when it has no watermark yet
-    (#26, wolf-access#165): the write happened; there is no token to carry,
-    and the token the client already holds stays."""
-    server.reply = Reply(status=status, body={"zedtoken": ""})
-    client = WolfAccessClient(server.url, CRED)
-    client.remember_zedtoken("zt-before")
-    result = create(client)
-    assert result == Written(None) and result.zedtoken is None
-    assert client.zedtoken == "zt-before"
+def test_a_create_answered_200_is_not_the_documented_answer(server):
+    server.reply = Reply(status=200, body={"zedtoken": "zt", "version": 1})
+    with pytest.raises(WolfAccessResponseError):
+        make(server.url).create_resource(ORG, name="Home")
 
 
-def test_an_empty_zedtoken_with_nothing_remembered_leaves_none(server):
-    server.reply = Reply(status=200, body={"zedtoken": ""})
-    client = WolfAccessClient(server.url, CRED)
-    assert client.register_type("wolfnotes/note", permissions=[]) == Written(None)
-    assert client.zedtoken is None
+def test_an_empty_token_is_none_and_keeps_the_remembered_one(server):
+    server.reply = Reply(status=201, body={"zedtoken": "", "version": 1})
+    client = make(server.url)
+    client.remember_zedtoken("zt-old")
+    assert client.create_resource(ORG, name="Home") == Versioned(1, None)
+    assert client.zedtoken == "zt-old"
 
 
-def test_unreachable_write_is_unavailable_and_retryable():
-    import socket
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        client = WolfAccessClient(f"http://127.0.0.1:{s.getsockname()[1]}", CRED, timeout=1)
-        with pytest.raises(WolfAccessUnavailable) as exc:
-            create(client)
-    assert exc.value.retryable is True
+@pytest.mark.parametrize("args, kwargs, error", [
+    (("t1",), {}, WrnError), ((TASK, "l1"), {}, WrnError), ((5,), {}, TypeError),
+    ((ORG,), {"name": ""}, ValueError), ((ORG,), {"name": 5}, ValueError),
+    ((TASK, LIST), {"principal_token": "a b"}, ValueError)])
+def test_create_checks_its_arguments(server, args, kwargs, error):
+    with pytest.raises(error):
+        make(server.url).create_resource(*args, **kwargs)
+    assert server.requests == []
 
 
-@pytest.mark.parametrize("status, retryable", [(502, True), (504, True), (404, False),
-                                               (307, False), (408, True)])
-def test_non_problem_error_is_an_http_error(server, status, retryable):
-    """An answer that is not a wolf-access problem (e.g. an HTML error page
-    from the edge) is a plain `WolfAccessHTTPError`, retryable on 408 and 5xx."""
-    server.reply = Reply(status=status, raw=b"<html>bad gateway</html>",
-                         content_type="text/html")
-    with pytest.raises(WolfAccessHTTPError) as exc:
-        create(WolfAccessClient(server.url, CRED))
-    assert not isinstance(exc.value, ProblemError)
-    assert exc.value.status == status and exc.value.retryable is retryable
+# --- GET /v1/resources/{wrn} -----------------------------------------------------------
+
+def test_get_a_resource(server):
+    server.reply = Reply(body={"parent_wrn": str(LIST)})
+    assert make(server.url).get_resource(TASK) == Resource(TASK, LIST, None)
+    (seen,) = server.requests
+    assert (seen.method, seen.path) == ("GET", resource_path(TASK))
+    assert seen.headers["authorization"] == f"Bearer {CRED}"
+
+
+def test_get_a_container_with_its_name(server):
+    server.reply = Reply(body={"parent_wrn": None, "name": "Home"})
+    assert make(server.url).get_resource(str(ORG)) == Resource(ORG, None, "Home")
+
+
+def test_get_a_missing_resource_is_not_found(server):
+    server.reply = problem("not_found", 404)
+    with pytest.raises(NotFoundError):
+        make(server.url).get_resource(TASK)
+
+
+@pytest.mark.parametrize("body", [{}, {"parent_wrn": 5}, {"parent_wrn": "l1"},
+                                  {"parent_wrn": None, "name": 5}])
+def test_a_malformed_resource_answer_is_a_response_error(server, body):
+    server.reply = Reply(body=body)
+    with pytest.raises(WolfAccessResponseError):
+        make(server.url).get_resource(TASK)
+
+
+# --- PATCH /v1/resources/{wrn} ---------------------------------------------------------
+
+def test_move_carries_the_version(server):
+    server.reply = Reply(body={"zedtoken": "zt-3", "version": 9})
+    new_list = Wrn("tasks", "list", "l2")
+    assert make(server.url).move_resource(TASK, new_list, version=8) == Versioned(9, "zt-3")
+    (seen,) = server.requests
+    assert (seen.method, seen.path) == ("PATCH", resource_path(TASK))
+    assert seen.body == {"parent_wrn": str(new_list), "version": 8}
+    assert seen.headers["authorization"] == f"Bearer {CRED}"
+
+
+def test_move_to_the_root(server):
+    server.reply = Reply(body={"zedtoken": "zt", "version": 2})
+    make(server.url).move_resource(ORG, None, version=1)
+    assert server.requests[0].body == {"parent_wrn": None, "version": 1}
+
+
+def test_a_stale_move_is_a_conflict(server):
+    server.reply = problem("conflict", 409, "the resource has changed since that version")
+    with pytest.raises(ConflictError) as exc:
+        make(server.url).move_resource(TASK, LIST, version=3)
+    assert "changed" not in str(exc.value) and "changed" in exc.value.detail
+
+
+@pytest.mark.parametrize("version", [0, -1, None, "8", True, 1.0])
+def test_move_and_delete_need_a_version(server, version):
+    with pytest.raises((ValueError, TypeError)):
+        make(server.url).move_resource(TASK, LIST, version=version)
+    with pytest.raises((ValueError, TypeError)):
+        make(server.url).delete_resource(TASK, version=version)
+    assert server.requests == []
+
+
+def test_version_is_keyword_only(server):
+    with pytest.raises(TypeError):
+        make(server.url).move_resource(TASK, LIST, 8)  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        make(server.url).delete_resource(TASK, 8)  # type: ignore[misc]
+
+
+# --- DELETE /v1/resources/{wrn}?version= ----------------------------------------------
+
+def test_delete_carries_the_version_in_the_query(server):
+    server.reply = Reply(body={"zedtoken": "zt-4"})
+    assert make(server.url).delete_resource(TASK2, version=12) == Written("zt-4")
+    (seen,) = server.requests
+    assert (seen.method, seen.path) == ("DELETE", f"{resource_path(TASK2)}?version=12")
+    assert seen.body is None
+
+
+def test_deleting_a_resource_with_children_is_a_conflict(server):
+    server.reply = problem("conflict", 409)
+    with pytest.raises(ConflictError):
+        make(server.url).delete_resource(LIST, version=2)
+
+
+# --- POST /v1/services/{service}/reconcile --------------------------------------------
+
+def change(**overrides):
+    item = {"id": "7b0c", "service": "tasks", "wrn": str(TASK2), "kind": "move",
+            "parent_wrn": str(LIST), "found_at": "2026-10-10T12:00:00.123456+00:00",
+            "approved_by": None, "approved_at": None}
+    item.update(overrides)
+    return item
+
+
+def test_reconcile_sends_the_full_list(server):
+    server.reply = Reply(body={"added": [str(TASK)], "changes": [change()],
+                               "zedtoken": "zt-5"})
+    client = make(server.url)
+    result = client.reconcile([(LIST, ORG), (str(TASK), str(LIST)), (ORG, None)])
+    (seen,) = server.requests
+    assert (seen.method, seen.path) == ("POST", "/v1/services/tasks/reconcile")
+    assert seen.body == {"resources": [
+        {"wrn": str(LIST), "parent_wrn": str(ORG)},
+        {"wrn": str(TASK), "parent_wrn": str(LIST)},
+        {"wrn": str(ORG), "parent_wrn": None}]}
+    assert result == Reconciled(
+        (TASK,), (ReconcileChange("7b0c", "tasks", TASK2, "move", LIST,
+                                  datetime(2026, 10, 10, 12, 0, 0, 123456, timezone.utc)),),
+        "zt-5")
+    assert client.zedtoken == "zt-5"
+
+
+def test_reconcile_takes_a_mappings_items(server):
+    server.reply = Reply(body={"added": [], "changes": [], "zedtoken": "zt"})
+    make(server.url).reconcile({TASK: LIST}.items())
+    assert server.requests[0].body == {"resources": [{"wrn": str(TASK),
+                                                      "parent_wrn": str(LIST)}]}
+
+
+def test_an_approved_removal_parses(server):
+    server.reply = Reply(body={"added": [], "zedtoken": "zt", "changes": [change(
+        kind="removal", parent_wrn=None, approved_by="wrn:access:user/op",  # wrn-ok: answer
+        approved_at="2026-10-10T13:00:00+00:00")]})
+    (c,) = make(server.url).reconcile([]).changes
+    assert (c.kind, c.parent_wrn, c.approved_by) == ("removal", None, "wrn:access:user/op")  # wrn-ok
+    assert c.approved_at == datetime(2026, 10, 10, 13, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("body", [
+    {"added": [], "changes": []},                                       # no zedtoken
+    {"added": {}, "changes": [], "zedtoken": "zt"},
+    {"added": ["t1"], "changes": [], "zedtoken": "zt"},                 # not a WRN
+    {"added": [], "changes": [change(kind="delete")], "zedtoken": "zt"},
+    {"added": [], "changes": [change(found_at="yesterday")], "zedtoken": "zt"},
+    {"added": [], "changes": [change(wrn="t2")], "zedtoken": "zt"},
+    {"added": [], "changes": [{"id": "1"}], "zedtoken": "zt"},
+])
+def test_a_malformed_reconcile_answer_is_a_response_error(server, body):
+    server.reply = Reply(body=body)
+    with pytest.raises(WolfAccessResponseError):
+        make(server.url).reconcile([])
+
+
+@pytest.mark.parametrize("resources, error", [
+    ([TASK], ValueError), ([(TASK,)], ValueError), ([("t1", None)], WrnError),
+    ([(TASK, "l1")], WrnError)])
+def test_reconcile_checks_the_list(server, resources, error):
+    with pytest.raises(error):
+        make(server.url).reconcile(resources)
+    assert server.requests == []
+
+
+def test_a_refused_reconcile_is_typed(server):
+    server.reply = problem("forbidden", 403)
+    with pytest.raises(ForbiddenError):
+        make(server.url).reconcile([(TASK, LIST)])
