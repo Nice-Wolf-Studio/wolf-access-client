@@ -14,7 +14,7 @@ permissions:
   contents: read
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     strategy:
       matrix:
         python: ["3.10", "3.12"]
@@ -44,7 +44,7 @@ jobs:
       - run: python -m pytest -q -rs
 
   secret-scan:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,7 +58,7 @@ jobs:
 
   install-from-tag:
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     env:
       REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
