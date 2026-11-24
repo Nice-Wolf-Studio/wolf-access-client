@@ -44,12 +44,13 @@ last write it made (or one passed to `remember_zedtoken`) and sends it as
 `context.consistency_token` on every evaluation, so a check made after a
 write is at least as fresh as that write. It keeps no decision.
 
-Transport rules: `https://` for any host, `http://` only for private hosts
-(loopback, `localhost`, `*.railway.internal`; wolf-access refuses plain HTTP
-at its edge, AC-22). It speaks HTTP with `http.client` directly: no
-environment proxies, no redirects, and certificates are always verified with
-the client's own SSL context, so a credential only ever goes to `base_url`'s
-host.
+Transport rules: `https://` for any host, `http://` only for loopback hosts
+(`localhost`, `127.0.0.1`, `::1`), or `*.railway.internal` when running on
+Railway (`RAILWAY_PRIVATE_DOMAIN` or `RAILWAY_ENVIRONMENT_ID` set) or with
+`allow_private_http=True` (wolf-access refuses plain HTTP at its edge, AC-22).
+It speaks HTTP with `http.client` directly: no environment proxies, no
+redirects, and certificates are always verified with the client's own SSL
+context, so a credential only ever goes to `base_url`'s host.
 
 `timeout` is a per-operation limit: each connect attempt, the send and each
 socket read wait at most `timeout`. Between reads of the response body the
@@ -69,6 +70,7 @@ import http.client
 import ipaddress
 import json
 import math
+import os
 import re
 import ssl
 import time
@@ -84,7 +86,6 @@ from .errors import (
     DecisionRefused,
     ProblemError,
     TokenExchangeError,
-    WolfAccessError,
     WolfAccessHTTPError,
     WolfAccessResponseError,
     WolfAccessUnavailable,
@@ -147,13 +148,36 @@ Credential = Union[str, Callable[[], str]]
 Token = Union[str, ExchangedToken]
 
 
-def _private_host(host: str) -> bool:
-    if host == "localhost" or host.endswith(_PRIVATE_SUFFIX):
+def _loopback_host(host: str) -> bool:
+    if host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _on_railway() -> bool:
+    return bool(os.environ.get("RAILWAY_PRIVATE_DOMAIN", "").strip()
+                or os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip())
+
+
+def _validate_host(host: str, netloc: str) -> None:
+    try:
+        ipaddress.ip_address(host)
+        return
+    except ValueError:
+        pass
+    if "[" in netloc or "]" in netloc:
+        raise ValueError("base_url has an invalid IPv6 host")
+    if len(host) > 253 or any(not label or len(label) > 63 for label in host.split(".")):
+        raise ValueError("base_url has an invalid host name")
+    try:
+        encoded = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        raise ValueError("base_url has an invalid host name") from None
+    if len(encoded) > 253 or any(not label or len(label) > 63 for label in encoded.split(".")):
+        raise ValueError("base_url has an invalid host name")
 
 
 def _check_timeout(timeout: Any) -> float:
@@ -178,7 +202,7 @@ class _Target:
     display: str
 
 
-def _target(base_url: Any) -> _Target:
+def _target(base_url: Any, *, allow_private_http: bool = False) -> _Target:
     if not isinstance(base_url, str) or not base_url.isascii() or any(
             ord(c) <= 32 or ord(c) == 127 for c in base_url):
         raise ValueError("base_url must be a printable ASCII URL without whitespace")
@@ -187,6 +211,7 @@ def _target(base_url: Any) -> _Target:
         raise ValueError("base_url must be an http:// or https:// URL")
     if parts.query or parts.fragment or "@" in parts.netloc:
         raise ValueError("base_url must not carry a query, fragment or user info")
+    _validate_host(parts.hostname, parts.netloc)
     try:
         port = parts.port
     except ValueError:
@@ -195,8 +220,11 @@ def _target(base_url: Any) -> _Target:
         # Always explicit: http.client would otherwise read the last group of
         # a bare IPv6 host as the port.
         port = 443 if parts.scheme == "https" else 80
-    if parts.scheme == "http" and not _private_host(parts.hostname):
-        raise ValueError("plain http:// is allowed only for private hosts; use https://")
+    if parts.scheme == "http" and not _loopback_host(parts.hostname):
+        if not (parts.hostname.endswith(_PRIVATE_SUFFIX)
+                and (allow_private_http or _on_railway())):
+            raise ValueError("plain http:// is allowed only for loopback or Railway private "
+                             "hosts; use https://")
     return _Target(https=parts.scheme == "https", host=parts.hostname, port=port,
                    path_prefix=parts.path.rstrip("/"), display=base_url.rstrip("/"))
 
@@ -256,9 +284,17 @@ def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def _reject_constant(token: str) -> Any:
+    raise ValueError(f"invalid JSON constant {token!r}")
+
+
 def _json_object(raw: bytes) -> dict[str, Any]:
     try:
-        data = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
+        text = raw.decode("utf-8")
+        if text.startswith("\ufeff"):
+            raise ValueError("unexpected UTF-8 BOM")
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys,
+                          parse_constant=_reject_constant)
     except (ValueError, RecursionError):
         raise WolfAccessResponseError("response is not a JSON object with unique keys") \
             from None
@@ -304,8 +340,11 @@ class WolfAccessClient:
     (a JWT the service signs, AC-22)."""
 
     def __init__(self, base_url: str, service_credential: Credential, *, service: str,
-                 timeout: float = DEFAULT_TIMEOUT) -> None:
-        self._target = _target(base_url)
+                 timeout: float = DEFAULT_TIMEOUT,
+                 allow_private_http: bool = False) -> None:
+        if not isinstance(allow_private_http, bool):
+            raise ValueError("allow_private_http must be True or False")
+        self._target = _target(base_url, allow_private_http=allow_private_http)
         self._service = _service_name(service)
         if callable(service_credential):
             self._credential: Credential = service_credential
@@ -674,6 +713,15 @@ class WolfAccessClient:
             conn.request(method, self._target.path_prefix + path, body=data, headers=headers)
             response = conn.getresponse()
             success = 200 <= response.status < 300
+            try:
+                _check_content_length(response)
+            except ValueError:
+                if success:
+                    raise WolfAccessResponseError(
+                        "conflicting or invalid Content-Length") from None
+                raise
+            if success and response.length is not None and response.length > max_body:
+                raise WolfAccessResponseError("response is too large")
             limit = max_body if success else MAX_ERROR_BODY
             chunks: list[bytes] = []
             size = 0
@@ -693,8 +741,6 @@ class WolfAccessClient:
             if success and response.length:  # the connection closed before Content-Length
                 raise http.client.IncompleteRead(b"".join(chunks), response.length)
             return _Response(response.status, response.msg, b"".join(chunks))
-        except WolfAccessError:
-            raise
         except (http.client.HTTPException, OSError, ValueError) as exc:
             # OSError covers timeouts, refused connections and TLS failures.
             raise WolfAccessUnavailable(
@@ -774,6 +820,21 @@ def _change(item: Any) -> ReconcileChange:
         None if item["approved_at"] is None else _answer_time(item["approved_at"]))
 
 
+def _check_content_length(response: http.client.HTTPResponse) -> None:
+    raw_values = response.msg.get_all("Content-Length") or []
+    if not raw_values:
+        return
+    parsed: list[int] = []
+    for raw in raw_values:
+        for item in raw.split(","):
+            token = item.strip()
+            if not token or not token.isascii() or not token.isdigit():
+                raise ValueError("invalid Content-Length header")
+            parsed.append(int(token))
+    if len(set(parsed)) > 1:
+        raise ValueError("conflicting Content-Length headers")
+
+
 def _decision(item: Any) -> Decision:
     if not isinstance(item, dict) or not isinstance(item.get("decision"), bool):
         raise WolfAccessResponseError("an answer has no boolean 'decision'")
@@ -782,6 +843,7 @@ def _decision(item: Any) -> Decision:
         context = {}
     if not isinstance(context, dict):
         raise WolfAccessResponseError("an answer's 'context' is not an object")
+    context = {k: v for k, v in context.items() if k != "reason_admin"}
     return Decision(allowed=item["decision"], context=context)
 
 

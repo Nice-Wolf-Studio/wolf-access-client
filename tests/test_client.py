@@ -162,6 +162,14 @@ def test_null_context_in_the_response_is_an_empty_context(server):
     assert evaluate(make(server.url)) == Decision(allowed=True, context={})
 
 
+def test_reason_admin_is_stripped_from_decision_context(server):
+    server.reply = Reply(body={"decision": True, "context": {"reason_admin": "x", "ok": 1}})
+    d = evaluate(make(server.url))
+    assert d == Decision(allowed=True, context={"ok": 1})
+    assert "reason_admin" not in d.context
+    assert "reason_admin" not in Decision(allowed=True, context={"reason_admin": "x"}).context
+
+
 def test_decision_is_hashable_copyable_and_serializable(server):
     server.reply = Reply(body={"decision": True, "context": {"k": "v"}})
     d = evaluate(make(server.url))
@@ -320,10 +328,20 @@ def test_redirect_is_not_followed(server):
         assert other.requests == []  # the credential never left for another host
 
 
-@pytest.mark.parametrize("raw", [b"not json", b"[]", b"{}", b'{"decision": "true"}',
-                                 b'{"decision": 1}', b'{"decision": true, "context": []}',
-                                 b"[" * 200000,
-                                 b'{"decision": false, "decision": true}'])
+@pytest.mark.parametrize("raw", [
+    b"not json", b"[]", b"{}", b'{"decision": "true"}',
+    b'{"decision": 1}', b'{"decision": true, "context": []}',
+    b"[" * 200000,
+    b'{"decision": false, "decision": true}',
+    '{"decision":true}'.encode("utf-16"),
+    '{"decision":true}'.encode("utf-16-le"),
+    '{"decision":true}'.encode("utf-32"),
+    b"\x80\xff",
+    b'\xef\xbb\xbf{"decision":true}',
+    b'{"decision":true,"context":{"x":NaN}}',
+    b'{"decision":true,"context":{"y":Infinity}}',
+    b'{"decision":true,"context":{"z":-Infinity}}',
+])
 def test_malformed_200_is_a_response_error(server, raw):
     server.reply = Reply(raw=raw)
     with pytest.raises(WolfAccessResponseError):
@@ -334,6 +352,39 @@ def test_oversized_body_is_a_response_error(server):
     server.reply = Reply(raw=b'{"decision": true, "pad": "' + b"a" * (2 * 1024 * 1024) + b'"}')
     with pytest.raises(WolfAccessResponseError):
         evaluate(make(server.url, CRED))
+
+
+def test_oversized_content_length_is_refused_before_reading_body():
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: 50000000\r\n\r\n"
+    with RawServer(head, b'{"decision":true}', gap=0.6) as srv:
+        start = time.monotonic()
+        with pytest.raises(WolfAccessResponseError):
+            evaluate(make(srv.url, CRED, timeout=0.25))
+        assert time.monotonic() - start < 0.2
+
+
+@pytest.mark.parametrize("raw", [
+    b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nContent-Length: 19\r\n\r\n{\"decision\": true}",
+    b"HTTP/1.1 200 OK\r\nContent-Length: 18, 19\r\n\r\n{\"decision\": true}",
+    b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n{\"decision\": true}",
+])
+def test_conflicting_or_invalid_content_length_on_2xx_is_response_error(raw):
+    with RawServer(raw) as srv:
+        with pytest.raises(WolfAccessResponseError):
+            evaluate(make(srv.url, CRED, timeout=2))
+
+
+def test_conflicting_content_length_on_error_status_is_unavailable():
+    raw = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\nno"
+    with RawServer(raw) as srv:
+        with pytest.raises(WolfAccessUnavailable):
+            evaluate(make(srv.url, CRED, timeout=2))
+
+
+def test_identical_duplicate_content_length_is_accepted():
+    raw = b'HTTP/1.1 200 OK\r\nContent-Length: 17\r\nContent-Length: 17\r\n\r\n{"decision":true}'
+    with RawServer(raw) as srv:
+        assert evaluate(make(srv.url, CRED, timeout=2)).allowed is True
 
 
 @pytest.mark.parametrize("raw", [
@@ -399,10 +450,52 @@ def test_plain_http_is_refused_for_public_hosts(url):
 
 
 @pytest.mark.parametrize("url", ["https://wolf-access.example.com",
-                                 "http://wolf-access.railway.internal:8000",
                                  "http://localhost:8000", "http://127.0.0.1:9",
                                  "http://[::1]:9"])
-def test_https_anywhere_and_http_only_on_private_hosts(url):
+def test_https_anywhere_and_http_only_on_private_hosts(url, monkeypatch):
+    monkeypatch.delenv("RAILWAY_PRIVATE_DOMAIN", raising=False)
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT_ID", raising=False)
+    make(url, CRED)
+
+
+def test_plain_http_to_railway_internal_requires_railway_or_opt_in(monkeypatch):
+    monkeypatch.delenv("RAILWAY_PRIVATE_DOMAIN", raising=False)
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT_ID", raising=False)
+    with pytest.raises(ValueError):
+        WolfAccessClient("http://x.railway.internal", CRED, service="tasks")
+    assert WolfAccessClient("http://x.railway.internal", CRED, service="tasks",
+                            allow_private_http=True)
+    monkeypatch.setenv("RAILWAY_PRIVATE_DOMAIN", "tasks.railway.internal")
+    assert WolfAccessClient("http://wolf-access.railway.internal:8000", CRED, service="tasks")
+    monkeypatch.delenv("RAILWAY_PRIVATE_DOMAIN", raising=False)
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT_ID", "env-123")
+    assert WolfAccessClient("http://wolf-access.railway.internal", CRED, service="tasks")
+
+
+def test_allow_private_http_must_be_a_bool():
+    with pytest.raises(ValueError):
+        WolfAccessClient("https://wolf-access.example", CRED, service="tasks",
+                         allow_private_http="yes")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("url", [
+    "https://a..example.com",
+    "https://.example.com",
+    "https://example.com.",
+    f"https://{'a' * 64}.example.com",
+    f"https://{'a.' * 126}aa",
+    "https://[not-an-ip]",
+])
+def test_invalid_dns_hostnames_are_refused_at_construction(url):
+    with pytest.raises(ValueError):
+        make(url, CRED)
+
+
+@pytest.mark.parametrize("url", [
+    f"https://{'a' * 63}.example.com",
+    f"https://{'a.' * 126}a",
+])
+def test_max_length_valid_dns_hostnames_are_accepted(url):
     make(url, CRED)
 
 
