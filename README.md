@@ -455,7 +455,7 @@ check request shapes as well as answers. The WRN tests run every conformance cas
 skipped. CI runs everything on Python 3.10 and 3.12 against a throwaway Postgres
 (`WAC_REQUIRE_POSTGRES=1` makes a skip a failure), scans the full git history for secrets
 (TruffleHog), and on every release tag installs that tag in a clean environment with no
-credentials. A release tag `vX.Y.Z` must match the `pyproject.toml` version `X.Y.Z`.
+credentials. A release tag `vX.Y.Z` must match `wolf_access_client.__version__` (`X.Y.Z`).
 
 `tests/test_live.py` runs the client against a real wolf-access server (Postgres and SpiceDB
 behind it). CI does not run it: wolf-access is private. Start one with

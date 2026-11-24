@@ -467,6 +467,17 @@ def test_broken_http_is_unavailable(raw):
             evaluate(make(srv.url, CRED, timeout=2))
 
 
+def test_cut_short_response_consistently_raises_incomplete_read():
+    import http.client
+    cut_short = b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"decision": '
+    with RawServer(cut_short) as srv:
+        client = make(srv.url, CRED, timeout=2)
+        for _ in range(100):
+            with pytest.raises(WolfAccessUnavailable) as exc:
+                evaluate(client)
+            assert isinstance(exc.value.__cause__, http.client.IncompleteRead)
+
+
 # --- timeout ------------------------------------------------------------------------
 
 def _timed_out_fast(srv, timeout=0.5):
@@ -491,9 +502,12 @@ def test_slow_drip_body_cannot_outlast_the_timeout():
 def test_concurrent_calls_are_not_capped(server):
     server.reply = Reply(delay=0.3)
     client = make(server.url, CRED, timeout=3)
+    start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=60) as pool:
         results = list(pool.map(lambda _: evaluate(client), range(60)))
+    elapsed = time.monotonic() - start
     assert all(r.allowed for r in results)
+    assert elapsed < 3.0
 
 
 @pytest.mark.parametrize("timeout", [None, 0, -1, float("inf"), float("nan"), "5", True,
