@@ -34,10 +34,10 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
       WAC_REQUIRE_POSTGRES: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[test]"
@@ -46,7 +46,7 @@ jobs:
   secret-scan:
     runs-on: ${{ fromJSON(vars.LINUX_RUNNER || '"ubuntu-latest"') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -54,7 +54,7 @@ jobs:
         run: >-
           docker run --rm -v "$PWD:/repo"
           trufflesecurity/trufflehog:3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
-          git file:///repo --no-update --fail --results=verified,unknown
+          git file:///repo --no-update --fail --results=verified,unverified,unknown --drop-unverified-jwt-results
 
   install-from-tag:
     if: github.ref_type == 'tag'
@@ -63,7 +63,7 @@ jobs:
       REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
       - name: Clean venv, no credentials, install the tag

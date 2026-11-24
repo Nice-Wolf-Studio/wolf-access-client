@@ -168,7 +168,7 @@ class RawServer:
             with conn:
                 conn.settimeout(2)
                 try:
-                    conn.recv(65536)
+                    _read_http_request(conn)
                     for chunk in self._chunks:
                         if self._stop.is_set():
                             break
@@ -186,6 +186,32 @@ class RawServer:
         self._stop.set()
         self._thread.join(5)
         self._sock.close()
+
+
+def _read_http_request(conn: Any) -> None:
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        part = conn.recv(65536)
+        if not part:
+            return
+        buf.extend(part)
+    head_end = buf.index(b"\r\n\r\n") + 4
+    content_length = 0
+    for line in bytes(buf[:head_end]).split(b"\r\n")[1:]:
+        if b":" in line:
+            name, value = line.split(b":", 1)
+            if name.strip().lower() == b"content-length":
+                try:
+                    content_length = max(0, int(value.strip()))
+                except ValueError:
+                    content_length = 0
+                break
+    remaining = content_length - (len(buf) - head_end)
+    while remaining > 0:
+        part = conn.recv(min(65536, remaining))
+        if not part:
+            return
+        remaining -= len(part)
 
 
 MAX_ROWS, LIST_LIMIT = 500, 1000
