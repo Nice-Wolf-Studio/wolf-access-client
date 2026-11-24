@@ -83,6 +83,17 @@ def test_an_item_error_is_a_deny_that_says_why(server):
     assert results[0].error is None
 
 
+def test_reason_admin_is_stripped_from_batch_decisions(server):
+    server.reply = Reply(body={"evaluations": [
+        {"decision": True, "context": {"reason_admin": "internal", "ok": 1}},
+        {"decision": False, "context": {"reason_admin": "deny-why"}},
+        {"decision": True},
+    ]})
+    results = batch(make(server.url))
+    assert results == [Decision(True, {"ok": 1}), Decision(False, {}), Decision(True)]
+    assert all("reason_admin" not in d.context for d in results)
+
+
 @pytest.mark.parametrize("semantic, decisions, expected", [
     ("deny_on_first_deny", [True, False], [True, False, None]),
     ("deny_on_first_deny", [False], [False, None, None]),

@@ -214,9 +214,11 @@ No exception's `str` or `repr` carries text the server sent; `ProblemError.detai
 
 ## Transport
 
-- `https://` for any host; plain `http://` is refused except for private hosts (loopback,
-  `localhost`, `*.railway.internal`). Certificates are always verified, environment proxies are
-  ignored and redirects are not followed, so the credential only goes to `base_url`'s host.
+- `https://` for any host; plain `http://` is refused except for loopback (`localhost`,
+  `127.0.0.1`, `::1`), and `*.railway.internal` only when running on Railway
+  (`RAILWAY_PRIVATE_DOMAIN` or `RAILWAY_ENVIRONMENT_ID` set) or with `allow_private_http=True`.
+  Certificates are always verified, environment proxies are ignored and redirects are not
+  followed, so the credential only goes to `base_url`'s host.
 - **Timeout.** `timeout` (default 5 s, at most 3600 s) is a per-operation limit: each connect
   attempt, the send and each socket read wait at most `timeout`, and between reads of the
   response body the call stops once `timeout` has passed since it began. It does **not** bound

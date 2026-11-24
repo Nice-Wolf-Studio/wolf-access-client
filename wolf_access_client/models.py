@@ -52,7 +52,9 @@ class Decision:
             raise TypeError("Decision.allowed must be a bool")
         if not isinstance(self.evaluated, bool):
             raise TypeError("Decision.evaluated must be a bool")
-        object.__setattr__(self, "context", dict(self.context))
+        ctx = dict(self.context)
+        ctx.pop("reason_admin", None)
+        object.__setattr__(self, "context", ctx)
 
     def __bool__(self) -> bool:
         return self.allowed
