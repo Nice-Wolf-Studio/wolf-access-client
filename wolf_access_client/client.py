@@ -52,28 +52,34 @@ It speaks HTTP with `http.client` directly: no environment proxies, no
 redirects, and certificates are always verified with the client's own SSL
 context, so a credential only ever goes to `base_url`'s host.
 
-`timeout` is a per-operation limit: each connect attempt, the send and each
-socket read wait at most `timeout`. Between reads of the response body the
-call also stops once `timeout` has passed since it began. It does NOT bound
-the whole call: several connect attempts, slowly sent headers or slow chunked
-framing can make one call take several times `timeout` (issue #2). Every such
-call still ends in `WolfAccessUnavailable` (deny; on a write, the outcome is
-unknown). A search makes one call per page. Calls run on the caller's thread
-and start no threads.
+`timeout` bounds the whole call (connect attempts, TLS handshake, sending the
+request, and reading the response; DNS lookup uses the system resolver's own
+limits). Every timed-out or broken call ends in `WolfAccessUnavailable` (deny;
+on a write, the outcome is unknown). Consecutive calls reuse idle HTTP/1.1
+keep-alive connections with thread-safe isolation; idempotent calls retry once
+on a fresh connection if a pooled connection dropped before answering, while
+non-idempotent writes never double-send. A search makes one call per page.
+Calls run on the caller's thread and start no threads.
 
 Standard library only.
 """
 
 from __future__ import annotations
 
+import errno
 import http.client
+import io
 import ipaddress
 import json
 import math
 import os
 import re
+import selectors
+import socket
 import ssl
+import threading
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import Message
@@ -353,6 +359,25 @@ class WolfAccessClient:
         self._timeout = _check_timeout(timeout)
         self._ssl_context = ssl.create_default_context()
         self._zedtoken: str | None = None
+        self._pool_lock = threading.Lock()
+        self._idle: list[_DeadlineHTTPConnection] = []
+        self._pool_gen = 0
+        self._finalizer = weakref.finalize(self, _close_conns, self._idle)
+
+    def close(self) -> None:
+        """Close any idle pooled connections."""
+        with self._pool_lock:
+            self._pool_gen += 1
+            idle = list(self._idle)
+            self._idle.clear()
+        for conn in idle:
+            conn.close()
+
+    def __enter__(self) -> "WolfAccessClient":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     def __repr__(self) -> str:
         return f"WolfAccessClient({self._target.display!r}, service={self._service!r})"
@@ -400,7 +425,7 @@ class WolfAccessClient:
                                 for p in _seq(permissions, "permissions")],
                 "roles": [_item(r, SchemaRole, "roles").wire() for r in _seq(roles, "roles")]}
         path = f"{SERVICES_PATH}/{quote(self._service, safe='')}/schema"
-        data = self._ok(self._json("PUT", path, body, principal_token), (200,))
+        data = self._ok(self._json("PUT", path, body, principal_token, idempotent=True), (200,))
         return self._written(data)
 
     # --- the tree: /v1/resources (INT-D2..D5, AC-1, AC-3, AC-6, AC-7) ------------------
@@ -430,7 +455,7 @@ class WolfAccessClient:
         resource wolf-access does not hold is `NotFoundError`."""
         w = as_wrn(wrn)
         response = self._request("GET", self._resource_path(w), None, max_body=MAX_BODY,
-                                 accept=_JSON_ACCEPT)
+                                 accept=_JSON_ACCEPT, idempotent=True)
         data = self._ok(response, (200,))
         parent, name = data.get("parent_wrn"), data.get("name")
         if "parent_wrn" not in data or not (parent is None or isinstance(parent, str)) \
@@ -518,7 +543,8 @@ class WolfAccessClient:
             form["client_wrn"] = str(as_wrn(client_wrn, "client_wrn"))
         response = self._request("POST", TOKEN_PATH, urlencode(form).encode("ascii"),
                                  max_body=MAX_BODY, accept="application/json",
-                                 content_type="application/x-www-form-urlencoded")
+                                 content_type="application/x-www-form-urlencoded",
+                                 idempotent=True)
         if response.status != 200:
             raise _token_error(response)
         data = _json_object(response.body)
@@ -638,7 +664,7 @@ class WolfAccessClient:
         return out
 
     def _decide(self, path: str, data: bytes, max_body: int) -> dict[str, Any]:
-        response = self._request("POST", path, data, max_body=max_body)
+        response = self._request("POST", path, data, max_body=max_body, idempotent=True)
         if response.status != 200:
             raise DecisionRefused(response.status, retry_after=_retry_after(response.headers))
         return _json_object(response.body)
@@ -646,14 +672,15 @@ class WolfAccessClient:
     # --- /v1 answers ------------------------------------------------------------------
 
     def _json(self, method: str, path: str, body: Mapping[str, Any],
-              principal_token: Token | None, *, max_body: int = MAX_BODY) -> _Response:
+              principal_token: Token | None, *, max_body: int = MAX_BODY,
+              idempotent: bool = False) -> _Response:
         bearer = None
         if principal_token is not None:
             raw = principal_token.access_token if isinstance(
                 principal_token, ExchangedToken) else principal_token
             bearer = _bearer(raw, "principal_token")
         return self._request(method, path, _encode(body), max_body=max_body,
-                             accept=_JSON_ACCEPT, bearer=bearer)
+                             accept=_JSON_ACCEPT, bearer=bearer, idempotent=idempotent)
 
     @staticmethod
     def _ok(response: _Response, statuses: tuple[int, ...]) -> dict[str, Any]:
@@ -683,12 +710,32 @@ class WolfAccessClient:
 
     # --- transport --------------------------------------------------------------------
 
-    def _connection(self) -> http.client.HTTPConnection:
+    def _connection(self, deadline: float | None = None) -> _DeadlineHTTPConnection:
         t = self._target
+        dl = deadline if deadline is not None else (time.monotonic() + self._timeout)
         if t.https:
-            return http.client.HTTPSConnection(t.host, t.port, timeout=self._timeout,
-                                               context=self._ssl_context)
-        return http.client.HTTPConnection(t.host, t.port, timeout=self._timeout)
+            return _DeadlineHTTPSConnection(t.host, t.port, timeout=self._timeout,
+                                            context=self._ssl_context, deadline=dl)
+        return _DeadlineHTTPConnection(t.host, t.port, timeout=self._timeout, deadline=dl)
+
+    def _acquire(self, deadline: float) -> tuple[_DeadlineHTTPConnection, bool, int]:
+        while True:
+            with self._pool_lock:
+                gen = self._pool_gen
+                conn = self._idle.pop() if self._idle else None
+            if conn is None:
+                return self._connection(deadline), False, gen
+            if _conn_reusable(conn):
+                conn.set_deadline(deadline)
+                return conn, True, gen
+            conn.close()
+
+    def _release(self, conn: _DeadlineHTTPConnection, gen: int) -> None:
+        with self._pool_lock:
+            if gen == self._pool_gen and len(self._idle) < 64:
+                self._idle.append(conn)
+                return
+        conn.close()
 
     def _service_bearer(self) -> str:
         if callable(self._credential):
@@ -697,59 +744,269 @@ class WolfAccessClient:
 
     def _request(self, method: str, path: str, data: bytes | None, *, max_body: int,
                  accept: str = "application/json", bearer: str | None = None,
-                 content_type: str = "application/json") -> _Response:
+                 content_type: str = "application/json",
+                 idempotent: bool = False) -> _Response:
         """Send one request and read the whole answer. A success body over
         `max_body` is a `WolfAccessResponseError`; an error body is read up to
         `MAX_ERROR_BODY` and dropped beyond it."""
         token = bearer if bearer is not None else self._service_bearer()
         deadline = time.monotonic() + self._timeout
-        conn: http.client.HTTPConnection | None = None
-        response: http.client.HTTPResponse | None = None
         headers = {"Authorization": f"Bearer {token}", "Accept": accept}
         if data is not None:
             headers["Content-Type"] = content_type
+        conn, reused, gen = self._acquire(deadline)
         try:
-            conn = self._connection()
-            conn.request(method, self._target.path_prefix + path, body=data, headers=headers)
-            response = conn.getresponse()
-            success = 200 <= response.status < 300
-            try:
-                _check_content_length(response)
-            except ValueError:
-                if success:
-                    raise WolfAccessResponseError(
-                        "conflicting or invalid Content-Length") from None
-                raise
-            if success and response.length is not None and response.length > max_body:
-                raise WolfAccessResponseError("response is too large")
-            limit = max_body if success else MAX_ERROR_BODY
-            chunks: list[bytes] = []
-            size = 0
-            while True:
-                if time.monotonic() > deadline:
-                    raise TimeoutError("deadline passed while reading the body")
-                chunk = response.read1(_CHUNK)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > limit:
-                    if success:
+            for attempt in range(2):
+                response: http.client.HTTPResponse | None = None
+                keep_conn = False
+                got_response = False
+                try:
+                    conn.request(method, self._target.path_prefix + path, body=data,
+                                 headers=headers)
+                    response = conn.getresponse()
+                    got_response = True
+                    success = 200 <= response.status < 300
+                    try:
+                        _check_content_length(response)
+                    except ValueError:
+                        if success:
+                            raise WolfAccessResponseError(
+                                "conflicting or invalid Content-Length") from None
+                        raise
+                    if success and response.length is not None and response.length > max_body:
                         raise WolfAccessResponseError("response is too large")
-                    chunks = []
-                    break
-                chunks.append(chunk)
-            if success and response.length:  # the connection closed before Content-Length
-                raise http.client.IncompleteRead(b"".join(chunks), response.length)
-            return _Response(response.status, response.msg, b"".join(chunks))
+                    limit = max_body if success else MAX_ERROR_BODY
+                    chunks: list[bytes] = []
+                    size = 0
+                    truncated_err = False
+                    while True:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("deadline passed while reading the body")
+                        chunk = response.read1(_CHUNK)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > limit:
+                            if success:
+                                raise WolfAccessResponseError("response is too large")
+                            chunks = []
+                            truncated_err = True
+                            break
+                        chunks.append(chunk)
+                    if success and response.length:
+                        raise http.client.IncompleteRead(b"".join(chunks), response.length)
+                    out = _Response(response.status, response.msg, b"".join(chunks))
+                    can_reuse = (not truncated_err and not response.will_close
+                                 and conn.sock is not None)
+                    response.close()
+                    keep_conn = can_reuse and response.isclosed()
+                    return out
+                except (http.client.RemoteDisconnected, ConnectionError, ssl.SSLEOFError):
+                    if attempt == 0 and reused and idempotent and not got_response:
+                        conn.close()
+                        conn, reused = self._connection(deadline), False
+                        continue
+                    raise
+                finally:
+                    if response is not None:
+                        response.close()
+                    if keep_conn:
+                        self._release(conn, gen)
+                    else:
+                        conn.close()
         except (http.client.HTTPException, OSError, ValueError) as exc:
             # OSError covers timeouts, refused connections and TLS failures.
             raise WolfAccessUnavailable(
                 f"no answer from wolf-access ({type(exc).__name__})") from exc
-        finally:
-            if response is not None:
-                response.close()
-            if conn is not None:
-                conn.close()
+        raise AssertionError("unreachable")
+
+
+def _wait_io(sock: socket.socket, write: bool, deadline: float) -> None:
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError("request timed out")
+    event = selectors.EVENT_WRITE if write else selectors.EVENT_READ
+    with selectors.DefaultSelector() as sel:
+        sel.register(sock, event)
+        if not sel.select(rem):
+            raise TimeoutError("request timed out")
+
+
+def _connect_tcp(host: str, port: int, deadline: float) -> socket.socket:
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError("getaddrinfo returns an empty list")
+    last_err: OSError | None = None
+    for af, socktype, proto, _canonname, sa in infos:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("connect timed out")
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(rem)
+            sock.connect(sa)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError as exc:
+                if exc.errno != errno.ENOPROTOOPT:
+                    raise
+            sock.settimeout(0.0)
+            return sock
+        except OSError as exc:
+            last_err = exc
+            if sock is not None:
+                sock.close()
+    assert last_err is not None
+    raise last_err
+
+
+def _wrap_tls(context: ssl.SSLContext, sock: socket.socket, host: str,
+              deadline: float) -> ssl.SSLSocket:
+    ssl_sock = context.wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
+    try:
+        ssl_sock.settimeout(0.0)
+        while True:
+            try:
+                ssl_sock.do_handshake()
+                return ssl_sock
+            except ssl.SSLWantReadError:
+                _wait_io(ssl_sock, False, deadline)
+            except ssl.SSLWantWriteError:
+                _wait_io(ssl_sock, True, deadline)
+    except BaseException:
+        ssl_sock.close()
+        raise
+
+
+class _DeadlineSocket:
+    """Non-blocking socket wrapper enforcing a monotonic whole-call deadline."""
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        self._sock = sock
+        self.deadline = deadline
+        self._io_refs = 0
+        self._closed = False
+
+    def _remaining(self) -> float:
+        rem = self.deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("request timed out")
+        return rem
+
+    def fileno(self) -> int:
+        return self._sock.fileno()
+
+    def gettimeout(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def settimeout(self, value: float | None) -> None:
+        pass
+
+    def recv_into(self, buffer: Any, nbytes: int | None = None, flags: int = 0) -> int:
+        while True:
+            self._remaining()
+            try:
+                if nbytes is None and flags == 0:
+                    return self._sock.recv_into(buffer)
+                return self._sock.recv_into(buffer, nbytes, flags)
+            except (BlockingIOError, ssl.SSLWantReadError):
+                _wait_io(self._sock, False, self.deadline)
+            except ssl.SSLWantWriteError:
+                _wait_io(self._sock, True, self.deadline)
+
+    def sendall(self, data: Any, flags: int = 0) -> None:
+        if flags != 0:
+            raise ValueError("non-zero flags not allowed in sendall")
+        with memoryview(data) as view, view.cast("B") as byte_view:
+            sent, total = 0, len(byte_view)
+            while sent < total:
+                self._remaining()
+                try:
+                    n = self._sock.send(byte_view[sent:])
+                    if n == 0:
+                        raise ConnectionResetError("socket connection broken")
+                    sent += n
+                except (BlockingIOError, ssl.SSLWantWriteError):
+                    _wait_io(self._sock, True, self.deadline)
+                except ssl.SSLWantReadError:
+                    _wait_io(self._sock, False, self.deadline)
+
+    def makefile(self, mode: str = "rb", buffering: int | None = None, *,
+                 encoding: str | None = None, errors: str | None = None,
+                 newline: str | None = None) -> Any:
+        if mode != "rb":
+            raise ValueError(f"unsupported mode {mode!r}")
+        raw = socket.SocketIO(self, "r")  # type: ignore[arg-type]
+        self._io_refs += 1
+        buf_size = io.DEFAULT_BUFFER_SIZE if buffering is None or buffering < 0 else buffering
+        return raw if buf_size == 0 else io.BufferedReader(raw, buf_size)
+
+    def _decref_socketios(self) -> None:
+        if self._io_refs > 0:
+            self._io_refs -= 1
+        if self._closed and self._io_refs <= 0:
+            self._sock.close()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._io_refs <= 0:
+            self._sock.close()
+
+
+class _DeadlineConnMixin:
+    _deadline: float
+    sock: Any
+
+    def set_deadline(self, deadline: float) -> None:
+        self._deadline = deadline
+        if isinstance(self.sock, _DeadlineSocket):
+            self.sock.deadline = deadline
+
+
+class _DeadlineHTTPConnection(_DeadlineConnMixin, http.client.HTTPConnection):
+    def __init__(self, host: str, port: int, *, timeout: float, deadline: float) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        self.sock = _DeadlineSocket(
+            _connect_tcp(self.host, self.port, self._deadline), self._deadline)
+
+
+class _DeadlineHTTPSConnection(_DeadlineConnMixin, http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, *, timeout: float,
+                 context: ssl.SSLContext, deadline: float) -> None:
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        raw = _connect_tcp(self.host, self.port, self._deadline)
+        try:
+            ssl_sock = _wrap_tls(self._context, raw, self.host, self._deadline)
+        except BaseException:
+            raw.close()
+            raise
+        self.sock = _DeadlineSocket(ssl_sock, self._deadline)
+
+
+def _close_conns(conns: list[_DeadlineHTTPConnection]) -> None:
+    while conns:
+        conns.pop().close()
+
+
+def _conn_reusable(conn: _DeadlineConnMixin) -> bool:
+    sock = conn.sock
+    if not isinstance(sock, _DeadlineSocket):
+        return False
+    try:
+        if sock.fileno() < 0:
+            return False
+        with selectors.DefaultSelector() as sel:
+            sel.register(sock._sock, selectors.EVENT_READ)
+            return not sel.select(0)
+    except (OSError, ValueError):
+        return False
 
 
 # --- request parts ----------------------------------------------------------------------
