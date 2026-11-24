@@ -219,14 +219,15 @@ No exception's `str` or `repr` carries text the server sent; `ProblemError.detai
   (`RAILWAY_PRIVATE_DOMAIN` or `RAILWAY_ENVIRONMENT_ID` set) or with `allow_private_http=True`.
   Certificates are always verified, environment proxies are ignored and redirects are not
   followed, so the credential only goes to `base_url`'s host.
-- **Timeout.** `timeout` (default 5 s, at most 3600 s) is a per-operation limit: each connect
-  attempt, the send and each socket read wait at most `timeout`, and between reads of the
-  response body the call stops once `timeout` has passed since it began. It does **not** bound
-  the whole call: several connect attempts, slowly sent headers or slow chunked framing can make
-  one call take several times `timeout`
-  ([#2](https://github.com/Nice-Wolf-Studio/wolf-access-client/issues/2)). Such a call still
-  ends in `WolfAccessUnavailable`, i.e. deny. A search makes one call per page. Name lookup
-  uses the system resolver's own limits. Calls run on the caller's thread and start no threads.
+- **Timeout & connections.** `timeout` (default 5 s, at most 3600 s) bounds the whole call
+  across connect attempts, the TLS handshake, sending the request and reading the response (DNS
+  lookup uses the system resolver's own limits). Every timed-out or broken call ends in
+  `WolfAccessUnavailable`, i.e. deny. Consecutive calls reuse idle HTTP/1.1 keep-alive
+  connections with thread-safe isolation; if a pooled connection dropped before answering,
+  idempotent calls retry once on a fresh connection, while non-idempotent writes never
+  double-send. Call `client.close()` (or use `with WolfAccessClient(...) as client:`) to release
+  idle sockets early. A search makes one call per page. Calls run on the caller's thread and
+  start no threads.
 - Body limits: 1 MiB for a decision or write answer, 4 MiB for a search page, 64 MiB for a
   reconcile answer.
 - A credential or token must be an RFC 6750 bearer token (no spaces, line breaks or control

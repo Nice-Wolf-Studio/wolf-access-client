@@ -50,15 +50,19 @@ class _Server(ThreadingHTTPServer):
 
 
 class FakeWolfAccess:
-    def __init__(self, tls: tuple[str, str] | None = None) -> None:
+    def __init__(self, tls: tuple[str, str] | None = None, *,
+                 keep_alive: bool = False) -> None:
         self.reply = Reply()
         self.requests: list[Seen] = []
+        self.accepts: int = 0
         self._queued: dict[tuple[str, str], list[Reply]] = {}
         self._routes: dict[tuple[str, str], Callable[[Seen], Reply]] = {}
         self._lock = threading.Lock()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1" if keep_alive else "HTTP/1.0"
+
             def log_message(self, *args: Any) -> None:
                 pass
 
@@ -92,7 +96,14 @@ class FakeWolfAccess:
 
             do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
 
-        self._server = _Server(("127.0.0.1", 0), Handler)
+        class CountingServer(_Server):
+            def get_request(self):
+                req = super().get_request()
+                with outer._lock:
+                    outer.accepts += 1
+                return req
+
+        self._server = CountingServer(("127.0.0.1", 0), Handler)
         if tls is not None:
             import ssl
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
