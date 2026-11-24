@@ -70,6 +70,16 @@ def test_remembered_token_and_end_to_end_go_in_the_shared_context(server):
         "client_wrn": str(APP), "end_to_end": True, "consistency_token": "zt-9"}
 
 
+def test_forget_zedtoken_omits_consistency_token_from_evaluations(server):
+    server.reply = answers(True, True, True)
+    client = make(server.url)
+    client.remember_zedtoken("zt-9")
+    client.forget_zedtoken()
+    batch(client)
+    assert server.requests[0].body["context"] == {
+        "client_wrn": str(APP), "end_to_end": False}
+
+
 def test_an_item_error_is_a_deny_that_says_why(server):
     """wolf-access answers an item it cannot evaluate `{"decision": false,
     "context": {"error": {status, message}}}`."""

@@ -231,6 +231,75 @@ def test_remember_zedtoken_needs_a_token(token):
         make("https://wolf-access.example").remember_zedtoken(token)
 
 
+def test_forget_zedtoken_clears_remembered_token_for_evaluations(server):
+    client = make(server.url)
+    client.remember_zedtoken("zt-1")
+    client.forget_zedtoken()
+    assert client.zedtoken is None
+    evaluate(client)
+    assert "consistency_token" not in server.requests[0].body["context"]
+    client.forget_zedtoken()  # idempotent when already None
+    assert client.zedtoken is None
+
+
+def test_remember_zedtoken_and_writes_keep_last_recorded_token(server):
+    client = make(server.url)
+    client.remember_zedtoken("zt-new")
+    client.remember_zedtoken("zt-old")
+    assert client.zedtoken == "zt-old"
+    evaluate(client)
+    assert server.requests[0].body["context"]["consistency_token"] == "zt-old"
+
+    server.queue("POST", "/v1/resources",
+                 Reply(status=201, body={"zedtoken": "zt-2", "version": 1}),
+                 Reply(status=201, body={"zedtoken": "zt-1", "version": 1}))
+    client.create_resource(ORG, name="One")
+    assert client.zedtoken == "zt-2"
+    client.create_resource(ORG, name="Two")
+    assert client.zedtoken == "zt-1"
+    evaluate(client)
+    assert server.requests[-1].body["context"]["consistency_token"] == "zt-1"
+
+
+def test_explicit_stale_consistency_token_overrides_without_overwriting(server):
+    client = make(server.url)
+    client.remember_zedtoken("zt-new")
+    evaluate(client, consistency_token="zt-old")
+    assert server.requests[0].body["context"]["consistency_token"] == "zt-old"
+    assert client.zedtoken == "zt-new"
+
+
+def test_check_returns_bool_and_fails_closed(server):
+    client = make(server.url)
+    server.reply = Reply(body={"decision": True})
+    assert client.check(subject=USER, action="tasks.task.read", resource=TASK,
+                        client_wrn=APP) is True
+    server.reply = Reply(body={"decision": False})
+    assert client.check(subject=USER, action="tasks.task.read", resource=TASK,
+                        client_wrn=APP) is False
+
+    for status in (401, 429, 503):
+        server.reply = Reply(status=status, raw=b"refused", content_type="text/plain")
+        assert client.check(subject=USER, action="tasks.task.read", resource=TASK,
+                            client_wrn=APP) is False
+
+    server.reply = Reply(raw=b"not json")
+    assert client.check(subject=USER, action="tasks.task.read", resource=TASK,
+                        client_wrn=APP) is False
+
+    with refused_port() as port:
+        down = make(f"http://127.0.0.1:{port}", CRED, timeout=1)
+        assert down.check(subject=USER, action="tasks.task.read", resource=TASK,
+                          client_wrn=APP) is False
+
+    with pytest.raises(WrnError):
+        client.check(subject="bad", action="tasks.task.read", resource=TASK, client_wrn=APP)
+    with pytest.raises(ValueError):
+        client.check(subject=USER, action="", resource=TASK, client_wrn=APP)
+    with pytest.raises(TypeError):
+        client.check(subject=USER, action="tasks.task.read", resource=5, client_wrn=APP)
+
+
 # --- the service and its credential ---------------------------------------------------
 
 def test_service_is_required_and_is_a_wrn_segment():
@@ -599,11 +668,38 @@ def tls_server(tmp_path):
 
 
 def test_https_evaluation_succeeds_against_a_trusted_certificate(tls_server, monkeypatch):
+    from pathlib import Path
     fake, cert = tls_server
-    monkeypatch.setenv("SSL_CERT_FILE", cert)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     url = fake.url.replace("http://127.0.0.1", "https://localhost")
-    assert evaluate(make(url, CRED)).allowed
+    assert evaluate(make(url, CRED, cafile=cert)).allowed
+    assert evaluate(make(url, CRED, cafile=Path(cert))).allowed
     assert fake.requests[0].headers["authorization"] == f"Bearer {CRED}"
+
+    ctx = ssl.create_default_context(cafile=cert)
+    assert evaluate(make(url, CRED, ssl_context=ctx)).allowed
+
+
+def test_ssl_context_validation_and_cafile_exclusivity(tls_server):
+    _, cert = tls_server
+    no_verify = ssl.create_default_context()
+    no_verify.check_hostname = False
+    no_verify.verify_mode = ssl.CERT_NONE
+    with pytest.raises(ValueError):
+        make("https://wolf-access.example", CRED, ssl_context=no_verify)
+
+    no_host = ssl.create_default_context()
+    no_host.check_hostname = False
+    with pytest.raises(ValueError):
+        make("https://wolf-access.example", CRED, ssl_context=no_host)
+
+    with pytest.raises(ValueError):
+        make("https://wolf-access.example", CRED,
+             ssl_context=ssl.create_default_context(), cafile=cert)
+    with pytest.raises(ValueError):
+        make("https://wolf-access.example", CRED, cafile="")
+    with pytest.raises(ValueError):
+        make("https://wolf-access.example", CRED, ssl_context="not-a-context")
 
 
 def test_https_refuses_an_untrusted_certificate(tls_server, monkeypatch):

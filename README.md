@@ -94,6 +94,7 @@ client = WolfAccessClient("https://wolf-access.railway.internal", credential, se
 | `reconcile(resources)` | `POST /v1/services/{service}/reconcile` | service | `Reconciled(added, changes, zedtoken)` |
 | `exchange_token(subject, audience, *, client_wrn=None)` | `POST /v1/token` (RFC 8693, form) | service | `ExchangedToken` |
 | `evaluation(*, subject, action, resource, client_wrn, end_to_end=False, consistency_token=None)` | `POST /access/v1/evaluation` | service | `Decision` |
+| `check(*, subject, action, resource, client_wrn, end_to_end=False, consistency_token=None)` | `POST /access/v1/evaluation` | service | `bool` (`False` on deny or `WolfAccessError`) |
 | `evaluations(*, subject, client_wrn, items, semantic="execute_all", end_to_end=False, consistency_token=None)` | `POST /access/v1/evaluations` | service | `list[Decision]`, one per item |
 | `search_resources(*, subject, action, resource_type, client_wrn, end_to_end=False, page_size=None)` | `POST /access/v1/search/resource` | service | iterator of `Wrn` |
 
@@ -177,14 +178,25 @@ A real deny is a `Decision(allowed=False)` value, never an exception. Every fail
 decision raises `AccessUnavailable`: unreachable, timeout or TLS failure
 (`WolfAccessUnavailable`), any status but 200 (`DecisionRefused`, which also carries `.status`
 and `.retry_after`), or a malformed or misaligned answer (`WolfAccessResponseError`). Treat it as
-deny.
+deny, or call `client.check(subject=..., action=..., resource=..., client_wrn=...) -> bool`, which
+returns `True` only on `Decision(allowed=True)` and `False` on `Decision(allowed=False)` or any
+`WolfAccessError` (`AccessUnavailable`), while still raising `WrnError` / `ValueError` / `TypeError`
+on invalid caller arguments before sending.
 
 ### Consistency (AC-6)
 
-The client keeps the consistency token (ZedToken) of the last write it made, or one passed to
-`remember_zedtoken`, and sends it as `context.consistency_token` on every evaluation, so a check
-made after a write is at least as fresh as it. Pass `consistency_token=` to use another. The
-client keeps no decision between calls. (wolf-access's search reads no consistency token.)
+The client keeps a single consistency token (`client.zedtoken`): the **last-recorded** token from
+a write response or `remember_zedtoken(token)` (not necessarily the newest, because tokens are
+opaque and cannot be ordered client-side). On a shared client with concurrent writers, a later
+recording overwrites an earlier one, so concurrent writers should pass their own token explicitly
+via `consistency_token=`. Call `forget_zedtoken()` to clear `client.zedtoken` back to `None`.
+
+Precedence on `evaluation` and `evaluations`: a non-blank `consistency_token=` overrides
+`client.zedtoken` for that single call without updating `client.zedtoken`; `None` or a blank string
+falls back to `client.zedtoken`. Server-side (`AC-6`), `wolf-access` bounds freshness by requiring
+at least its `spicedb_watermark` when `consistency_token` is omitted and running
+`fully_consistent` when any non-empty `consistency_token` is sent. The client keeps no decision
+between calls. (wolf-access's search reads no consistency token.)
 
 ### Errors
 
@@ -233,6 +245,9 @@ No exception's `str` or `repr` carries text the server sent; `ProblemError.detai
 - A credential or token must be an RFC 6750 bearer token (no spaces, line breaks or control
   characters; strip a trailing newline from a secret file). It is never logged, put in `repr`,
   or included in an error.
+- **Custom CA / TLS context.** Pass `cafile=` (a PEM CA bundle path) or `ssl_context=` (an
+  `ssl.SSLContext` with `CERT_REQUIRED` and `check_hostname=True`) to `WolfAccessClient` to
+  trust a private CA without mutating `SSL_CERT_FILE`.
 
 ## Changes from 0.6.0
 

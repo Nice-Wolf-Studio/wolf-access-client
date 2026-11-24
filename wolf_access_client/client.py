@@ -92,6 +92,7 @@ from .errors import (
     DecisionRefused,
     ProblemError,
     TokenExchangeError,
+    WolfAccessError,
     WolfAccessHTTPError,
     WolfAccessResponseError,
     WolfAccessUnavailable,
@@ -339,6 +340,30 @@ class _Response:
     body: bytes
 
 
+def _ssl_context_from(ssl_context: Any, cafile: Any) -> ssl.SSLContext:
+    if ssl_context is not None and cafile is not None:
+        raise ValueError("pass at most one of ssl_context or cafile")
+    if ssl_context is not None:
+        if not isinstance(ssl_context, ssl.SSLContext):
+            raise ValueError("ssl_context must be an ssl.SSLContext")
+        if ssl_context.verify_mode != ssl.CERT_REQUIRED or not ssl_context.check_hostname:
+            raise ValueError("ssl_context must require certificate verification and "
+                             "hostname checking")
+        return ssl_context
+    if cafile is not None:
+        if not isinstance(cafile, (str, os.PathLike)):
+            raise ValueError("cafile must be a path to a CA certificate bundle")
+        path = os.fspath(cafile)
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("cafile must be a non-empty path")
+        ctx = ssl.create_default_context(cafile=path)
+        if ctx.verify_mode != ssl.CERT_REQUIRED or not ctx.check_hostname:
+            raise ValueError("ssl_context must require certificate verification and "
+                             "hostname checking")
+        return ctx
+    return ssl.create_default_context()
+
+
 class WolfAccessClient:
     """The client of one registering service, `service` (its WRN segment:
     `finops`, `wolf_notes`), authenticating with `service_credential`: its
@@ -347,7 +372,9 @@ class WolfAccessClient:
 
     def __init__(self, base_url: str, service_credential: Credential, *, service: str,
                  timeout: float = DEFAULT_TIMEOUT,
-                 allow_private_http: bool = False) -> None:
+                 allow_private_http: bool = False,
+                 ssl_context: ssl.SSLContext | None = None,
+                 cafile: str | os.PathLike[str] | None = None) -> None:
         if not isinstance(allow_private_http, bool):
             raise ValueError("allow_private_http must be True or False")
         self._target = _target(base_url, allow_private_http=allow_private_http)
@@ -357,7 +384,7 @@ class WolfAccessClient:
         else:
             self._credential = _bearer(service_credential, "service_credential")
         self._timeout = _check_timeout(timeout)
-        self._ssl_context = ssl.create_default_context()
+        self._ssl_context = _ssl_context_from(ssl_context, cafile)
         self._zedtoken: str | None = None
         self._pool_lock = threading.Lock()
         self._idle: list[_DeadlineHTTPConnection] = []
@@ -403,6 +430,10 @@ class WolfAccessClient:
         if not isinstance(token, str) or not token.strip():
             raise ValueError("token must be a non-empty string")
         self._zedtoken = token
+
+    def forget_zedtoken(self) -> None:
+        """Clear any remembered consistency token so subsequent checks omit it."""
+        self._zedtoken = None
 
     def _record(self, token: str | None) -> None:
         if token:
@@ -571,6 +602,22 @@ class WolfAccessClient:
                 "resource": _resource(resource),
                 "context": self._context(client_wrn, end_to_end, consistency_token)}
         return _decision(self._decide(EVALUATION_PATH, _encode(body), MAX_BODY))
+
+    def check(self, *, subject: Wrn | str, action: str, resource: Wrn | str,
+              client_wrn: Wrn | str, end_to_end: bool = False,
+              consistency_token: str | None = None) -> bool:
+        """Fail-closed boolean helper (INT-F4): True only when `evaluation`
+        returns `Decision(allowed=True)`, and False on deny or any
+        `WolfAccessError` (`AccessUnavailable`). Bad arguments still raise
+        `WrnError` / `ValueError` / `TypeError` before anything is sent."""
+        try:
+            return self.evaluation(
+                subject=subject, action=action, resource=resource,
+                client_wrn=client_wrn, end_to_end=end_to_end,
+                consistency_token=consistency_token,
+            ).allowed
+        except WolfAccessError:
+            return False
 
     def evaluations(self, *, subject: Wrn | str, client_wrn: Wrn | str,
                     items: Sequence[EvaluationItem], semantic: str = "execute_all",
