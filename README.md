@@ -139,7 +139,10 @@ has children (AC-7) or grants. Under a parent, a refused create and a missing pa
 for a root). wolf-access adds what it lacks at once; every move and removal it finds waits for
 an operator's approval and is answered in `changes` (`ReconcileChange(id, service, wrn, kind,
 parent_wrn, found_at, approved_by, approved_at)`, `kind` `move` or `removal`). Grants are never
-removed.
+removed. Per [docs/decisions.md](docs/decisions.md) (`[default — changeable]`), `reconcile` is
+the library's default INT-D6 repair path after an ambiguous or failed write: each service keeps
+its own repair trigger/sweep and drains via `reconcile` (which applies missing additions using
+the service credential, without needing a principal token).
 
 ### Token exchange (INT-C5, AC-20)
 
@@ -297,9 +300,12 @@ It adds the shared WRN library (#50).
 `RelayState`, `AccessMode`, `AccessGate`, `GateHealth`). They delivered lifecycle rows to
 `POST /v1/services/{service}/changes` for the CUT-D1 side-by-side cut-over, which wolf-access
 no longer serves; INT-L1 drops the side-by-side cut-over. Their replacement is the synchronous
-tree calls (INT-D3) plus `reconcile` (INT-D7). INT-D6's repair outbox of `(operation, wrn,
-parent_wrn, version)` is not shipped here: replaying a create under a parent needs the acting
-principal's token (AC-3), which that row does not carry (wolf-access-client#51).
+tree calls (INT-D3) plus `reconcile` (INT-D7). Per
+[docs/decisions.md](docs/decisions.md) (`[default — changeable]`, resolving
+wolf-access-client#51), `wolf-access-client` does not ship an INT-D6 outbox/relay (replaying a
+`create` under a parent requires the acting principal's token under AC-3); each service keeps
+its own repair trigger/sweep and drains missed updates through `reconcile` (or replays
+`create_resource` with its own stored principal token).
 
 **Kept**: `canonical_json` and `diff_hash` (standalone; the sign-off calls they served are
 gone), the transport and its rules, `Decision`, `Written`, `ProblemError` and its parsing.

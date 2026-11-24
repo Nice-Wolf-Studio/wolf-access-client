@@ -350,3 +350,28 @@ def test_a_refused_reconcile_is_typed(server):
     server.reply = problem("forbidden", 403)
     with pytest.raises(ForbiddenError):
         make(server.url).reconcile([(TASK, LIST)])
+
+
+def test_reconcile_repairs_missed_child_create_with_service_credential(server):
+    """INT-D6 [default — changeable]: replaying create_resource under a parent
+    without a principal token is 401; reconcile repairs missed creates using
+    only the service credential."""
+    server.queue("POST", "/v1/resources", problem("unauthorized", 401))
+    server.queue("POST", "/v1/services/tasks/reconcile",
+                 Reply(body={"added": [str(TASK)], "changes": [], "zedtoken": "zt-rep"}))
+    client = make(server.url)
+    with pytest.raises(UnauthorizedError):
+        client.create_resource(TASK, LIST)
+    repaired = client.reconcile([(LIST, ORG), (TASK, LIST)])
+    assert TASK in repaired.added
+    assert server.requests[1].headers["authorization"] == f"Bearer {CRED}"
+
+
+def test_int_d6_reconcile_repair_decision_is_documented():
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    decisions = (root / "docs" / "decisions.md").read_text()
+    readme = (root / "README.md").read_text()
+    assert "[default — changeable]" in decisions
+    assert "reconcile" in decisions and "INT-D6" in decisions
+    assert "docs/decisions.md" in readme and "[default — changeable]" in readme
